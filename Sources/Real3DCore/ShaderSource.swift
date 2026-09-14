@@ -25,7 +25,10 @@ struct DepthParams {
     uint  hasPrev;     // 0 on the first frame
     uint  width;
     uint  height;
-    uint  _pad;
+    uint  metric;      // 1: output inverse metric depth (1/m) = calibA * v + calibB instead of normalized [0,1]
+    float calibA;
+    float calibB;
+    float _pad0, _pad1;
 };
 
 struct UpsampleParams {
@@ -35,10 +38,15 @@ struct UpsampleParams {
     int   radius;      // JBU radius in low-res pixels
     float sigmaSpatial;
     float sigmaRange;
-    float strength;    // max disparity in output pixels
-    float convergence; // normalized depth at zero parallax
-    float gamma;       // depth curve exponent
-    float _pad0, _pad1, _pad2;
+    float strength;    // artistic: max disparity in output pixels
+    float convergence; // artistic: normalized depth at zero parallax
+    float gamma;       // artistic: depth curve exponent
+    uint  metric;      // 1: orthostereo from inverse metric depth
+    float metricA;     // IPD / pixelPitch  (disparity of infinity, px)
+    float metricB;     // IPD * screenDistance / pixelPitch
+    float worldScale;  // multiplies scene depth
+    float maxCrossed;  // clamp for near objects (px)
+    float _pad0, _pad1;
 };
 
 struct StereoParams {
@@ -99,7 +107,12 @@ kernel void depthProcess(texture2d<float, access::read> raw [[texture(0)]],
     float v = raw.read(gid).r;
     if (!isfinite(v)) v = P.lo;
     if (P.invert) v = 1.0f / max(v, 1e-4f);
-    float n = saturate((v - P.lo) / max(P.hi - P.lo, 1e-6f));
+    float n;
+    if (P.metric) {
+        n = max(P.calibA * v + P.calibB, 0.0f);            // inverse metric depth, 1/m
+    } else {
+        n = saturate((v - P.lo) / max(P.hi - P.lo, 1e-6f));
+    }
     if (P.hasPrev) {
         float p = prev.read(gid).r;
         n = mix(p, n, P.alpha);
@@ -150,8 +163,16 @@ kernel void depthUpsample(texture2d<float, access::sample> depthLow [[texture(0)
         float bil = depthLow.sample(linearClamp, uv).r;
         d = mix(bil, d, saturate(wsum * 4.0f));
     }
-    d = pow(saturate(d), P.gamma);
-    float disp = P.strength * (d - P.convergence);
+    float disp;
+    if (P.metric) {
+        // Orthostereo: screen parallax = IPD * (1 - D/Z); positive = in front of the screen.
+        float invZ = max(d, 0.0f) / max(P.worldScale, 1e-3f);
+        disp = P.metricB * invZ - P.metricA;
+        disp = clamp(disp, -P.metricA, P.maxCrossed);
+    } else {
+        d = pow(saturate(d), P.gamma);
+        disp = P.strength * (d - P.convergence);
+    }
     dispOut.write(float4(disp, 0, 0, 1), gid);
 }
 

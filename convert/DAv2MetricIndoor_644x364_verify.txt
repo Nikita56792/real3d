@@ -1,0 +1,12 @@
+DAv2MetricIndoor_644x364
+source=depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf
+max_depth=20
+output=ImageType GRAYSCALE_FLOAT16
+polarity=metric depth in meters (larger = farther)
+status=PASS
+[photo0] /private/tmp/claude-501/-Users-nikitasyzdykov-Desktop-real3d/7f986937-4f79-4c04-8d56-888f1fcf552f/scratchpad/bench/photo.png
+  corr=1.00000 median_abs_rel=0.00026 mean_abs_rel=0.00032 max_abs_diff_m=0.044 status=PASS
+  coreml range: min 2.33  p5 2.65  median 10.07  p95 17.70  max 19.45 m
+[photo1] /private/tmp/claude-501/-Users-nikitasyzdykov-Desktop-real3d/7f986937-4f79-4c04-8d56-888f1fcf552f/scratchpad/bench/indoor.png
+  corr=1.00000 median_abs_rel=0.00045 mean_abs_rel=0.00050 max_abs_diff_m=0.008 status=PASS
+  coreml range: min 0.88  p5 1.10  median 2.35  p95 3.52  max 3.63 m

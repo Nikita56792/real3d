@@ -23,3 +23,38 @@ DA3Small_644x364: in 'image' 644x364 image(BGRA) -> out 'depth' 644x364 image(L0
   all load 0.08s | median 40.51 ms | p90 40.70 ms | min 39.62 ms | wall 40.49 ms -> 24.7 fps | range [0.198, 1.660]
   ane load 0.05s | median 38.89 ms | p90 39.06 ms | min 38.26 ms | wall 38.88 ms -> 25.7 fps | range [0.198, 1.660]
   gpu load 0.05s | median 11.57 ms | p90 11.70 ms | min 11.25 ms | wall 11.58 ms -> 86.4 fps | range [0.198, 1.657]
+
+# ---- 2026-09-14: METRIC models (output = depth in METERS, larger = farther) ----
+# Note: Real3D.app was running during all of these; the first GPU pass was contended (30-85 ms), the
+# re-run below (app idle-ish) matches the relative 644x364 model. ANE numbers were stable throughout.
+# Test photos: test_street.png (outdoor, Tokyo street, woman ~3-5 m) and test_indoor.png
+# (Wikimedia Commons "Cozy living room setting with a yellow sofa..." by Shixart1985, CC BY 2.0, center-cropped to 16:9).
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DAv2MetricOutdoor_644x364.mlpackage   (47 MB, VKITTI fine-tune, sigmoid*80)
+DAv2MetricOutdoor_644x364: in 'image' 644x364 image(BGRA) -> out 'depth' 644x364 image(L00h)
+  all load 6.44s | median 29.32 ms | p90 29.51 ms | min 28.70 ms | wall 29.32 ms -> 34.1 fps | range [6.859, 54.268]
+  ane load 6.37s | median 29.27 ms | p90 29.38 ms | min 28.89 ms | wall 29.24 ms -> 34.2 fps | range [6.859, 54.268]
+  gpu load 0.42s | median 16.16 ms | p90 16.51 ms | min 15.66 ms | wall 16.15 ms -> 61.9 fps | range [6.733, 53.683]
+  verify vs PyTorch (644x364): street corr=1.00000 median abs-rel=0.00035 | indoor corr=1.00000 median abs-rel=0.00073
+  metric range: street min 6.0 / median 29.6 / max 74.8 m (woman 10-12 m, road 7 m, far street 47 m) | indoor 6-23 m (out of domain: wrong)
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DAv2MetricIndoor_644x364.mlpackage    (47 MB, Hypersim fine-tune, sigmoid*20)
+DAv2MetricIndoor_644x364: in 'image' 644x364 image(BGRA) -> out 'depth' 644x364 image(L00h)
+  all load 6.20s | median 29.25 ms | p90 29.36 ms | min 28.98 ms | wall 29.26 ms -> 34.2 fps | range [2.515, 18.665]
+  ane load 5.95s | median 29.30 ms | p90 29.44 ms | min 29.19 ms | wall 29.30 ms -> 34.1 fps | range [2.515, 18.665]
+  gpu load 0.42s | median 16.12 ms | p90 16.24 ms | min 15.74 ms | wall 16.09 ms -> 62.2 fps | range [2.507, 18.698]
+  verify vs PyTorch (644x364): street corr=1.00000 median abs-rel=0.00026 | indoor corr=1.00000 median abs-rel=0.00045
+  metric range: indoor min 0.88 / median 2.35 / max 3.63 m (cups 1.33 m, sofa 2.7 m, wall 3.1 m) | street 2.3-19.5 m (woman 3.4-4 m)
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DA3MetricLarge_518x294.mlpackage      (637 MB, ViT-L, DPT exp head, universal metric)
+DA3MetricLarge_518x294: in 'image' 518x294 image(BGRA) -> out 'depth' 518x294 image(L00h)
+  all load 30.06s | median 134.65 ms | p90 134.74 ms | min 134.46 ms | wall 134.62 ms -> 7.4 fps | range [2.394, 44.183]   (ALL picks ANE here)
+  ane load 10.14s | median 134.43 ms | p90 134.58 ms | min 134.39 ms | wall 134.46 ms -> 7.4 fps | range [2.394, 44.183]
+  gpu load 0.73s | median 61.87 ms | p90 62.04 ms | min 61.50 ms | wall 61.88 ms -> 16.2 fps | range [2.396, 44.263]
+  verify vs PyTorch (518x294): street corr=1.00000 median abs-rel=0.00085 | indoor corr=1.00000 median abs-rel=0.00035
+  metric range: street min 1.8 / median 9.5 / max 56 m (woman 3.0-3.2 m, road 2.5 m, crowd 9 m, far street 41 m) | indoor 0.65-2.13 m (cups 0.86, sofa 1.7, wall 1.8 m)
+# Caveat (all three): absolute scale depends on input resolution/FOV. DAv2-metric at 644x364 reads ~10-15% farther than the
+# stock HF 924x518 preprocessing (same weights); the three "metric" models disagree by up to ~1.7x on the same photo
+# (street woman: DA3 3.1 m, MoGe-2 5.2 m, DAv2-indoor 3.7 m, DAv2-outdoor 11 m). The sky head of DA3 is dropped, so sky is
+# whatever the depth head says (~19 m on the street photo), not "max depth" like the DA3 python pipeline.
+# MoGe-2 ViT-S (ebowwa/moge-2-vits-normal-coreml fp16, 512x768, not converted here): input fp32 multiArray [1,3,512,768] RGB 0..1,
+# outputs points[1,512,768,3] (affine, z=exp), normal[1,512,768,3], mask[1,512,768], metric_scale[1]; NO depth output.
+# metric depth = (points.z + shift) * metric_scale, shift from a 1-D least squares on a 64x64 subsample (see moge2_coreml_probe.py).
+# GPU 40.6 ms / ALL 68.9 ms (python, contended). real3d-bench: "Model has no usable output".

@@ -8,3 +8,4 @@ convert/*.png
 *.mlpackage
 *.mlmodelc
 .DS_Store
+checkpoints/

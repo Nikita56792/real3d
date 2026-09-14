@@ -13,6 +13,9 @@ Needs the DA3 repo at ./DepthAnythingV3 (auto-cloned if missing).
 
 Usage:
   python convert_da3.py --width 644 --height 364 --out /path/DA3Small_644x364.mlpackage --photo photo.png
+  # metric ViT-L (depth in METERS), plain DINOv2-L + DPT (no RoPE / alternating attention):
+  python convert_da3.py --repo-id depth-anything/DA3METRIC-LARGE --config da3metric-large --metric \
+      --width 518 --height 294 --out /path/DA3MetricLarge_518x294.mlpackage --photo street.png --photo indoor.png
 """
 import argparse
 import os
@@ -175,10 +178,10 @@ class MonoDepthWrapper(nn.Module):
         return out.depth.squeeze(1).unsqueeze(1)          # (1, 1, H, W)
 
 
-def load_net(repo_id="depth-anything/DA3-SMALL", config_name="da3-small") -> DepthAnything3Net:
+def load_net(repo_id="depth-anything/DA3-SMALL", config_name="da3-small", ckpt=None) -> DepthAnything3Net:
     net = create_object(load_config(MODEL_REGISTRY[config_name]))
     net.eval()
-    ckpt = hf_hub_download(repo_id, filename="model.safetensors")
+    ckpt = ckpt or hf_hub_download(repo_id, filename="model.safetensors")
     state = load_safetensors(ckpt)
     if any(k.startswith("model.") for k in state):
         state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
@@ -199,15 +202,23 @@ def main():
     ap.add_argument("--width", type=int, default=644)
     ap.add_argument("--height", type=int, default=364)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--photo", default=None)
+    ap.add_argument("--photo", action="append", default=[], help="test image(s); may be repeated")
     ap.add_argument("--dump-dir", default=None)
     ap.add_argument("--tensor-output", action="store_true")
+    ap.add_argument("--repo-id", default="depth-anything/DA3-SMALL",
+                    help="HF repo, e.g. depth-anything/DA3-SMALL or depth-anything/DA3METRIC-LARGE")
+    ap.add_argument("--config", default="da3-small",
+                    help="DA3 config name (configs/*.yaml), e.g. da3-small, da3metric-large")
+    ap.add_argument("--ckpt", default=None, help="local model.safetensors (skips hf_hub_download)")
+    ap.add_argument("--metric", action="store_true",
+                    help="checkpoint outputs METRIC depth in meters (DA3METRIC-*); only affects metadata/report")
     args = ap.parse_args()
     W, H = args.width, args.height
     assert W % 14 == 0 and H % 14 == 0
-    print(f"=== DA3-Small -> Core ML {W}x{H} (grid {W // 14}x{H // 14} = {(W // 14) * (H // 14)} patches)")
+    label = f"DA3 {args.config} ({args.repo_id})"
+    print(f"=== {label} -> Core ML {W}x{H} (grid {W // 14}x{H // 14} = {(W // 14) * (H // 14)} patches)")
 
-    net = load_net()
+    net = load_net(args.repo_id, args.config, args.ckpt)
     backbone = net.backbone.pretrained
     patch_head_utils()
     freeze_pos_embed(backbone, H, W)
@@ -217,7 +228,7 @@ def main():
     # Reference from the *unmodified* forward path (RGB, normalised) before the BGR fold, for a sanity check.
     ref_rgb_depth = None
     if args.photo:
-        img = Image.open(args.photo).convert("RGB").resize((W, H), Image.BICUBIC)
+        img = Image.open(args.photo[0]).convert("RGB").resize((W, H), Image.BICUBIC)
         rgb = torch.from_numpy(np.asarray(img).astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
         xn = ((rgb - torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)) / torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)).unsqueeze(1)
         with torch.no_grad():
@@ -251,12 +262,15 @@ def main():
             print("  !! image output failed, falling back to tensor:", repr(e))
             mlmodel = convert([ct.TensorType(name="depth", dtype=np.float16)]); out_kind = "TensorType fp16 (fallback)"
     print(f"  converted in {time.time() - t0:.1f}s, output = {out_kind}")
-    mlmodel.author = "Depth Anything 3 Small (depth-anything/DA3-SMALL), monocular depth branch, coremltools"
-    mlmodel.short_description = (f"Depth Anything 3 Small, {W}x{H} BGRA input; output is DEPTH (larger = farther) "
-                                 f"as {W}x{H} float16 grayscale. ImageNet normalisation in-graph.")
+    units = "METRIC DEPTH IN METERS" if args.metric else "DEPTH (relative, camera-space)"
+    mlmodel.author = f"Depth Anything 3 {args.config} ({args.repo_id}), monocular depth branch, coremltools"
+    mlmodel.short_description = (f"Depth Anything 3 {args.config}, {W}x{H} BGRA input; output is {units} "
+                                 f"(larger = farther) as {W}x{H} float16 grayscale. ImageNet normalisation in-graph.")
     mlmodel.version = "1.0"
     mlmodel.input_description["image"] = f"{W}x{H} BGRA image, raw 0..255"
-    mlmodel.output_description["depth"] = "Depth (larger = farther), float16"
+    mlmodel.output_description["depth"] = f"{units.capitalize()} (larger = farther), float16"
+    mlmodel.user_defined_metadata["polarity"] = "depth"
+    mlmodel.user_defined_metadata["units"] = "meters" if args.metric else "relative"
     if os.path.exists(args.out):
         shutil.rmtree(args.out)
     mlmodel.save(args.out)
@@ -266,39 +280,61 @@ def main():
     print("  MIL ops:", dict(sorted(hist.items(), key=lambda kv: -kv[1])))
 
     if args.photo:
-        img = Image.open(args.photo).convert("RGB").resize((W, H), Image.BICUBIC)
-        bgr = np.asarray(img).astype(np.float32)[..., ::-1].copy()
-        t = torch.from_numpy(bgr).permute(2, 0, 1).unsqueeze(0).contiguous()
-        with torch.no_grad():
-            pt = wrapper(t)[0, 0].numpy()
-        c0 = float(np.corrcoef(normalized(pt).ravel(), normalized(ref_rgb_depth).ravel())[0, 1])
-        print(f"  wrapper(BGR) vs stock DA3(RGB) correlation = {c0:.5f}  max abs diff = {np.abs(pt - ref_rgb_depth).max():.4f}")
-        ml = ct.models.MLModel(args.out, compute_units=ct.ComputeUnit.ALL)
-        pred = ml.predict({"image": img})["depth"]
-        cm = np.asarray(pred).astype(np.float32).reshape(H, W)
-        corr = float(np.corrcoef(normalized(pt).ravel(), normalized(cm).ravel())[0, 1])
-        rel = float(np.abs(pt - cm).mean() / (np.abs(pt).mean() + 1e-9))
-        print(f"  pytorch range [{pt.min():.3f}, {pt.max():.3f}]  coreml range [{cm.min():.3f}, {cm.max():.3f}]  "
-              f"finite={np.isfinite(cm).all()}")
-        print(f"  correlation (per-image normalized) = {corr:.5f}   mean rel err = {rel:.4f}")
-        status = "PASS" if corr > 0.99 and np.isfinite(cm).all() else "FAIL"
-        print(f"  numeric check: {status}")
         base = os.path.splitext(os.path.basename(args.out))[0]
         dump_dir = args.dump_dir or os.path.dirname(args.out)
         os.makedirs(dump_dir, exist_ok=True)
+        ml = ct.models.MLModel(args.out, compute_units=ct.ComputeUnit.ALL)
+        unit = "m" if args.metric else ""
+
+        def stats(a):
+            a = a.astype(np.float64)
+            return (f"min {a.min():.2f}  p5 {np.percentile(a, 5):.2f}  median {np.median(a):.2f}  "
+                    f"p95 {np.percentile(a, 95):.2f}  max {a.max():.2f}{unit}")
 
         def to_u8(a):  # white = nearer for a depth map: invert
             inv = 1.0 / np.maximum(a, 1e-6)
             lo, hi = np.percentile(inv, 2), np.percentile(inv, 98)
             return (np.clip((inv - lo) / max(hi - lo, 1e-6), 0, 1) * 255).astype(np.uint8)
 
-        side = np.concatenate([np.asarray(img), np.stack([to_u8(pt)] * 3, -1), np.stack([to_u8(cm)] * 3, -1)], axis=1)
-        Image.fromarray(side).save(os.path.join(dump_dir, f"{base}_compare.png"))
+        results = []
+        for i, photo in enumerate(args.photo):
+            tag = f"photo{i}"
+            img = Image.open(photo).convert("RGB").resize((W, H), Image.BICUBIC)
+            bgr = np.asarray(img).astype(np.float32)[..., ::-1].copy()
+            t = torch.from_numpy(bgr).permute(2, 0, 1).unsqueeze(0).contiguous()
+            with torch.no_grad():
+                pt = wrapper(t)[0, 0].numpy()
+            if i == 0 and ref_rgb_depth is not None:
+                c0 = float(np.corrcoef(normalized(pt).ravel(), normalized(ref_rgb_depth).ravel())[0, 1])
+                print(f"  wrapper(BGR) vs stock DA3(RGB) correlation = {c0:.5f}  "
+                      f"max abs diff = {np.abs(pt - ref_rgb_depth).max():.4f}")
+            pred = ml.predict({"image": img})["depth"]
+            cm = np.asarray(pred).astype(np.float32).reshape(H, W)
+            finite = bool(np.isfinite(cm).all())
+            corr = float(np.corrcoef(normalized(pt).ravel(), normalized(cm).ravel())[0, 1])
+            abs_rel = np.abs(cm - pt) / np.maximum(np.abs(pt), 1e-3)
+            med_rel, mean_rel = float(np.median(abs_rel)), float(abs_rel.mean())
+            print(f"  [{tag}] {os.path.basename(photo)}")
+            print(f"     pytorch : {stats(pt)}")
+            print(f"     coreml  : {stats(cm)}   finite={finite}")
+            print(f"     corr={corr:.5f}  median abs-rel err={med_rel:.5f}  mean abs-rel err={mean_rel:.5f}  "
+                  f"max |diff|={np.abs(cm - pt).max():.3f}{unit}")
+            status = "PASS" if corr > 0.99 and finite and med_rel < 0.02 else "FAIL"
+            print(f"     numeric check: {status}")
+            side = np.concatenate([np.asarray(img), np.stack([to_u8(pt)] * 3, -1), np.stack([to_u8(cm)] * 3, -1)], axis=1)
+            cmp_path = os.path.join(dump_dir, f"{base}_{tag}_compare.png")
+            Image.fromarray(side).save(cmp_path)
+            np.save(os.path.join(dump_dir, f"{base}_{tag}_coreml_depth.npy"), cm)
+            results.append((tag, photo, corr, med_rel, mean_rel, status, stats(cm)))
+        overall = "PASS" if all(r[5] == "PASS" for r in results) else "FAIL"
         with open(os.path.join(dump_dir, f"{base}_verify.txt"), "w") as f:
-            f.write(f"{base}\ncorr={corr:.5f}\nrel_err={rel:.5f}\nstatus={status}\noutput={out_kind}\n"
-                    f"polarity=depth (larger = farther)\n")
-        print("  wrote", os.path.join(dump_dir, f"{base}_compare.png"), "(depth shown inverted: white = nearer)")
-        if status != "PASS":
+            f.write(f"{base}\nsource={args.repo_id} config={args.config}\noutput={out_kind}\n"
+                    f"polarity=depth (larger = farther){' in METERS' if args.metric else ''}\nstatus={overall}\n")
+            for tag, photo, corr, med_rel, mean_rel, status, st in results:
+                f.write(f"[{tag}] {photo}\n  corr={corr:.5f} median_abs_rel={med_rel:.5f} mean_abs_rel={mean_rel:.5f} "
+                        f"status={status}\n  coreml range: {st}\n")
+        print(f"  overall: {overall}  (compare PNGs in {dump_dir}, depth shown inverted: white = nearer)")
+        if overall != "PASS":
             sys.exit(2)
 
 

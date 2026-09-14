@@ -32,11 +32,16 @@ func writePNG(width: Int, height: Int, bgra: [UInt8], to path: String) {
     print("  wrote \(path) (\(width)x\(height))")
 }
 
-// --stereo <image> <model> <outprefix> [strength] [convergence] : run the full Metal pipeline offline.
+// --stereo <image> <model> <outprefix> [strength] [convergence] [--calib <metricModel>] [--metric [worldScale]]
 if args.first == "--stereo", args.count >= 4 {
     let imgURL = args[1], modelPath = args[2], prefix = args[3]
     let strength = args.count > 4 ? Float(args[4]) ?? 40 : 40
     let conv = args.count > 5 ? Float(args[5]) ?? 0.55 : 0.55
+    var calibPath: String? = nil
+    var metric = false
+    var worldScale: Float = 1
+    if let i = args.firstIndex(of: "--calib"), i + 1 < args.count { calibPath = args[i + 1] }
+    if let i = args.firstIndex(of: "--metric") { metric = true; if i + 1 < args.count, let w = Float(args[i + 1]) { worldScale = w } }
     guard let cg = loadImage(imgURL) else { print("cannot load image"); exit(1) }
     let renderer = try StereoRenderer()
     let engine = try DepthEngine(modelURL: URL(fileURLWithPath: modelPath), computeUnits: .cpuAndGPU)
@@ -44,8 +49,13 @@ if args.first == "--stereo", args.count >= 4 {
     engine.outputIsDepth = lower.contains("v3") || lower.contains("da3")
     try renderer.configureModel(inputWidth: engine.info.inputWidth, inputHeight: engine.info.inputHeight, inputFormat: engine.preferredInputPixelFormat,
                                 outputWidth: engine.info.outputWidth, outputHeight: engine.info.outputHeight)
+    let mainIsMetric = lower.contains("metric")
+    if mainIsMetric { engine.outputIsDepth = true }
     var st = renderer.settings
     st.strength = strength; st.convergence = conv; st.invertDepth = engine.outputIsDepth; st.temporalAlpha = 1
+    st.modelIsMetric = mainIsMetric
+    st.depthScaleMode = metric ? .metric : .artistic
+    st.worldScale = worldScale
     renderer.settings = st
     // Source = the image as a BGRA pixel buffer at its native size.
     let src = try makeTestInput(width: cg.width, height: cg.height, format: kCVPixelFormatType_32BGRA, image: cg)
@@ -65,6 +75,27 @@ if args.first == "--stereo", args.count >= 4 {
     print(String(format: "  inference %.1f ms, range [%.3f, %.3f]", (CACurrentMediaTime() - t0) * 1000, r.lo, r.hi))
     r.tag = readySlot!.index
     renderer.submitDepth(r)
+    if let calibPath {
+        let c = try DepthEngine(modelURL: URL(fileURLWithPath: calibPath), computeUnits: .all)
+        c.outputIsDepth = true
+        let cin = try DepthEngine.makePixelBuffer(width: c.info.inputWidth, height: c.info.inputHeight, format: c.preferredInputPixelFormat)
+        Pipeline.scale(readySlot!.pixelBuffer, into: cin)
+        let tc = CACurrentMediaTime()
+        let zr = try c.predict(cin)
+        let raw = Pipeline.readDepthMap(r.pixelBuffer), z = Pipeline.readDepthMap(zr.pixelBuffer)
+        if let fit = Pipeline.fitAffine(raw: raw, rawW: engine.info.outputWidth, rawH: engine.info.outputHeight, rawInvert: engine.outputIsDepth,
+                                        z: z, zW: c.info.outputWidth, zH: c.info.outputHeight) {
+            print(String(format: "  calibrator %@: %.1f ms, Z range [%.2f, %.2f] m -> 1/Z = %.4f*r + %.4f (inliers %.0f%%, MAD %.4f)",
+                         c.info.name as NSString, (CACurrentMediaTime() - tc) * 1000, 1 / zr.hi, 1 / zr.lo, fit.a, fit.b, fit.inliers * 100, fit.residual))
+            renderer.setCalibration(a: fit.a, b: fit.b, valid: true)
+        } else {
+            print("  calibration FAILED")
+        }
+    }
+    if metric {
+        let inf = st.viewer.infinityDisparity(px: st.outputWidth)
+        print(String(format: "  metric mode: infinity = %.1f px, screen at %.1f m, world scale %.2f", inf, st.viewer.screenDistanceM, worldScale))
+    }
     renderer.releaseSlot(readySlot!)
     let t1 = CACurrentMediaTime()
     renderer.renderFrame(layers: [])            // depth process + stereo

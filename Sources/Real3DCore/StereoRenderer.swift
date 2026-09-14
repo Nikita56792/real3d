@@ -24,7 +24,10 @@ struct DepthParams {
     var hasPrev: UInt32
     var width: UInt32
     var height: UInt32
-    var _pad: UInt32 = 0
+    var metric: UInt32 = 0
+    var calibA: Float = 1
+    var calibB: Float = 0
+    var _pad0: Float = 0, _pad1: Float = 0
 }
 
 struct UpsampleParams {
@@ -37,7 +40,12 @@ struct UpsampleParams {
     var strength: Float
     var convergence: Float
     var gamma: Float
-    var _pad0: Float = 0, _pad1: Float = 0, _pad2: Float = 0
+    var metric: UInt32 = 0
+    var metricA: Float = 0
+    var metricB: Float = 0
+    var worldScale: Float = 1
+    var maxCrossed: Float = 60
+    var _pad0: Float = 0, _pad1: Float = 0
 }
 
 struct StereoParams {
@@ -82,10 +90,39 @@ public enum UpsampleMode: Int, CaseIterable, Identifiable, Sendable {
     public var title: String { self == .bilinear ? "Bilinear" : "Edge-aware (joint bilateral)" }
 }
 
+public enum DepthScaleMode: Int, CaseIterable, Identifiable, Sendable {
+    case artistic = 0, metric = 1
+    public var id: Int { rawValue }
+    public var title: String { self == .artistic ? "Artistic (relative depth)" : "Real scale (metric)" }
+}
+
+/// Viewer geometry for orthostereo rendering (virtual screen of the glasses).
+public struct ViewerGeometry: Equatable, Sendable {
+    public var ipdMM: Float = 63
+    public var screenDistanceM: Float = 4.0
+    public var screenWidthM: Float = 3.25          // XREAL One: 147" 16:9 at 4 m
+    public init() {}
+    public init(ipdMM: Float, screenDistanceM: Float, screenWidthM: Float) {
+        self.ipdMM = ipdMM; self.screenDistanceM = screenDistanceM; self.screenWidthM = screenWidthM
+    }
+    /// Disparity (px) of a point at infinity for a per-eye width of `px` pixels.
+    public func infinityDisparity(px: Int) -> Float { ipdMM / 1000 / (screenWidthM / Float(px)) }
+}
+
 public struct RenderSettings: Equatable, Sendable {
     /// Per-eye output size.
     public var outputWidth: Int = 1920
     public var outputHeight: Int = 1080
+    public var depthScaleMode: DepthScaleMode = .artistic
+    public var viewer = ViewerGeometry()
+    /// Multiplies scene depth in metric mode (1 = as estimated).
+    public var worldScale: Float = 1.0
+    /// Auto world scale: enlarge the scene (never shrink below real scale) so the nearest content sits
+    /// `popBudgetPx` in front of the screen plane.
+    public var autoWorldScale: Bool = true
+    public var popBudgetPx: Float = 12
+    /// Clamp for crossed (pop-out) disparity in metric mode, px.
+    public var maxCrossedPx: Float = 60
     /// Maximum disparity in output pixels (interocular shift for the nearest point).
     public var strength: Float = 40
     /// Normalized depth (0 far … 1 near) placed at the screen plane.
@@ -102,6 +139,8 @@ public struct RenderSettings: Equatable, Sendable {
     public var swapEyes: Bool = false
     /// Model outputs depth (larger = farther) instead of inverse depth.
     public var invertDepth: Bool = false
+    /// Model outputs metric depth in meters (implies invertDepth); no calibration needed.
+    public var modelIsMetric: Bool = false
     public var useMetalFX: Bool = true
     public var showCursor: Bool = true
     public init() {}
@@ -118,6 +157,11 @@ public struct RenderStats: Sendable {
     public var usingMetalFX: Bool = false
     public var depthLo: Float = 0
     public var depthHi: Float = 0
+    public var metricActive: Bool = false
+    /// Effective world scale in metric mode (auto or manual).
+    public var worldScale: Float = 1
+    /// Nearest content depth (m) as estimated this frame, metric mode.
+    public var nearestM: Float = 0
     public init() {}
 }
 
@@ -167,6 +211,13 @@ public final class StereoRenderer: @unchecked Sendable {
     private var _depthDirty = false
     private var _paramsDirty = true
     private var _stats = RenderStats()
+    /// Affine calibration of the model's inverse depth to metric 1/Z (metric mode, relative models).
+    private var _calibA: Float = 1, _calibB: Float = 0, _calibValid = false
+
+    /// Sets 1/Z = a * raw + b for the current model (raw = model output after optional inversion).
+    public func setCalibration(a: Float, b: Float, valid: Bool) {
+        lock.withLock { _calibA = a; _calibB = b; _calibValid = valid; _paramsDirty = true }
+    }
 
     public var settings: RenderSettings {
         get { lock.withLock { _settings } }
@@ -193,6 +244,9 @@ public final class StereoRenderer: @unchecked Sendable {
     private var depthNormB: MTLTexture!
     private var depthPing = false
     private var depthHasPrev = false
+    private var lastMetricMode = false
+    private var autoScale: Float = 1
+    private var nearestM: Float = 0
     private var dispTex: MTLTexture!
     private var sbsTex: MTLTexture!
     private var sourceTexRef: CVMetalTexture?
@@ -337,6 +391,7 @@ public final class StereoRenderer: @unchecked Sendable {
         let depth = _latestDepth
         let depthDirty = _depthDirty; _depthDirty = false
         let paramsDirty = _paramsDirty; _paramsDirty = false
+        let calibA = _calibA, calibB = _calibB, calibValid = _calibValid
         var freeSlot: ModelInputSlot? = nil
         if sourceDirty, let fs = slots.first(where: { !$0.busy }) { fs.busy = true; freeSlot = fs }
         let guideSlot = (depth.map { $0.tag } ?? -1) >= 0 && (depth?.tag ?? 0) < slots.count ? slots[depth!.tag] : nil
@@ -390,8 +445,20 @@ public final class StereoRenderer: @unchecked Sendable {
             }
             let prev = depthPing ? depthNormA! : depthNormB!
             let out = depthPing ? depthNormB! : depthNormA!
+            let metric = s.depthScaleMode == .metric && (s.modelIsMetric || calibValid)
+            if metric != lastMetricMode { depthHasPrev = false; lastMetricMode = metric; autoScale = 1 }
+            if metric {
+                // Nearest content (98th percentile of 1/Z) drives the automatic world scale.
+                let invZnear = max(s.modelIsMetric ? depthHi : calibA * depthHi + calibB, 1e-4)
+                nearestM = 1 / invZnear
+                let pitch = s.viewer.screenWidthM / Float(s.outputWidth), ipd = s.viewer.ipdMM / 1000
+                let A = ipd / pitch, B = ipd * s.viewer.screenDistanceM / pitch
+                let target = max(1, B * invZnear / max(A + s.popBudgetPx, 1))
+                autoScale += (target - autoScale) * (depthHasPrev ? 0.15 : 1)
+            }
             var p = DepthParams(lo: depthLo, hi: depthHi, alpha: s.temporalAlpha, invert: s.invertDepth ? 1 : 0,
-                                hasPrev: depthHasPrev ? 1 : 0, width: UInt32(rawTex.width), height: UInt32(rawTex.height))
+                                hasPrev: depthHasPrev ? 1 : 0, width: UInt32(rawTex.width), height: UInt32(rawTex.height),
+                                metric: metric ? 1 : 0, calibA: s.modelIsMetric ? 1 : calibA, calibB: s.modelIsMetric ? 0 : calibB)
             let enc = cb.makeComputeCommandEncoder()!
             enc.setTexture(rawTex, index: 0); enc.setTexture(prev, index: 1); enc.setTexture(out, index: 2)
             enc.setBytes(&p, length: MemoryLayout<DepthParams>.stride, index: 0)
@@ -451,15 +518,20 @@ public final class StereoRenderer: @unchecked Sendable {
             if depthHasPrev {
                 let cur = depthPing ? depthNormA! : depthNormB!
                 let enc = cb.makeComputeCommandEncoder()!
+                let pitch = s.viewer.screenWidthM / Float(s.outputWidth)
+                let ipd = s.viewer.ipdMM / 1000
                 var up = UpsampleParams(outWidth: UInt32(s.outputWidth), outHeight: UInt32(s.outputHeight),
                                         mode: UInt32(guideTex == nil ? 0 : s.upsampleMode.rawValue),
                                         radius: Int32(s.jbuRadius), sigmaSpatial: 1.0, sigmaRange: s.jbuSigmaRange,
-                                        strength: s.strength, convergence: s.convergence, gamma: s.gamma)
+                                        strength: s.strength, convergence: s.convergence, gamma: s.gamma,
+                                        metric: lastMetricMode ? 1 : 0, metricA: ipd / pitch, metricB: ipd * s.viewer.screenDistanceM / pitch,
+                                        worldScale: s.autoWorldScale ? autoScale : s.worldScale, maxCrossed: s.maxCrossedPx)
                 enc.setTexture(cur, index: 0); enc.setTexture(guideTex ?? cur, index: 1); enc.setTexture(monoTex, index: 2); enc.setTexture(dispTex, index: 3)
                 enc.setBytes(&up, length: MemoryLayout<UpsampleParams>.stride, index: 0)
                 dispatch(enc, upsamplePSO, width: s.outputWidth, height: s.outputHeight)
 
-                var st = StereoParams(width: UInt32(s.outputWidth), height: UInt32(s.outputHeight), maxDisp: max(abs(s.strength), 1),
+                let searchRange: Float = lastMetricMode ? max(s.maxCrossedPx, ipd / pitch) : abs(s.strength)
+                var st = StereoParams(width: UInt32(s.outputWidth), height: UInt32(s.outputHeight), maxDisp: max(searchRange, 1),
                                       stretchThresh: s.stretchThreshold, swapEyes: s.swapEyes ? 1 : 0)
                 enc.setTexture(monoTex, index: 0); enc.setTexture(dispTex, index: 1); enc.setTexture(sbsTex, index: 2)
                 enc.setBytes(&st, length: MemoryLayout<StereoParams>.stride, index: 0)
@@ -583,6 +655,9 @@ public final class StereoRenderer: @unchecked Sendable {
             _stats.usingMetalFX = metalFX
             _stats.inferenceMs = lastInferenceMs
             _stats.depthLo = depthLo; _stats.depthHi = depthHi
+            _stats.metricActive = lastMetricMode
+            _stats.worldScale = _settings.autoWorldScale ? autoScale : _settings.worldScale
+            _stats.nearestM = nearestM
             if dt >= 0.5 {
                 _stats.renderFPS = Double(renderFrames) / dt
                 _stats.captureFPS = Double(captureFrames) / dt

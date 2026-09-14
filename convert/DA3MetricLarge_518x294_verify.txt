@@ -1,0 +1,11 @@
+DA3MetricLarge_518x294
+source=depth-anything/DA3METRIC-LARGE config=da3metric-large
+output=ImageType GRAYSCALE_FLOAT16
+polarity=depth (larger = farther) in METERS
+status=PASS
+[photo0] /private/tmp/claude-501/-Users-nikitasyzdykov-Desktop-real3d/7f986937-4f79-4c04-8d56-888f1fcf552f/scratchpad/bench/photo.png
+  corr=1.00000 median_abs_rel=0.00085 mean_abs_rel=0.00108 status=PASS
+  coreml range: min 1.84  p5 2.52  median 9.54  p95 38.56  max 56.03m
+[photo1] /private/tmp/claude-501/-Users-nikitasyzdykov-Desktop-real3d/7f986937-4f79-4c04-8d56-888f1fcf552f/scratchpad/bench/indoor.png
+  corr=1.00000 median_abs_rel=0.00035 mean_abs_rel=0.00043 status=PASS
+  coreml range: min 0.65  p5 0.77  median 1.48  p95 2.02  max 2.13m

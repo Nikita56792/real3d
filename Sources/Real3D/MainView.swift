@@ -200,11 +200,23 @@ struct MainView: View {
                     }
                 }
 
+                GroupBox("Depth scale") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("Mode", selection: $model.settings.depthScaleMode) {
+                            ForEach(DepthScaleMode.allCases) { m in Text(m.title).tag(m) }
+                        }
+                        if model.settings.depthScaleMode == .artistic {
+                            slider("Depth strength", value: $model.settings.strength, in: 0...120, format: "%.0f px")
+                            slider("Convergence (screen plane)", value: $model.settings.convergence, in: 0...1, format: "%.2f")
+                            slider("Depth curve", value: $model.settings.gamma, in: 0.4...2.5, format: "%.2f")
+                        } else {
+                            metricControls
+                        }
+                    }
+                }
+
                 GroupBox("3D") {
                     VStack(alignment: .leading, spacing: 8) {
-                        slider("Depth strength", value: $model.settings.strength, in: 0...120, format: "%.0f px")
-                        slider("Convergence (screen plane)", value: $model.settings.convergence, in: 0...1, format: "%.2f")
-                        slider("Depth curve", value: $model.settings.gamma, in: 0.4...2.5, format: "%.2f")
                         slider("Temporal smoothing", value: Binding(get: { 1 - model.settings.temporalAlpha }, set: { model.settings.temporalAlpha = 1 - $0 }), in: 0...0.9, format: "%.2f")
                         Picker("Depth upsampling", selection: $model.settings.upsampleMode) {
                             ForEach(UpsampleMode.allCases) { m in Text(m.title).tag(m) }
@@ -217,7 +229,9 @@ struct MainView: View {
                             let keep = model.settings
                             var s = RenderSettings()
                             s.outputWidth = keep.outputWidth; s.outputHeight = keep.outputHeight
-                            s.swapEyes = keep.swapEyes; s.useMetalFX = keep.useMetalFX; s.showCursor = keep.showCursor; s.invertDepth = keep.invertDepth
+                            s.swapEyes = keep.swapEyes; s.useMetalFX = keep.useMetalFX; s.showCursor = keep.showCursor
+                            s.invertDepth = keep.invertDepth; s.modelIsMetric = keep.modelIsMetric
+                            s.depthScaleMode = keep.depthScaleMode; s.viewer = keep.viewer
                             model.settings = s
                         }
                     }
@@ -242,12 +256,81 @@ struct MainView: View {
         }
     }
 
-    private func slider(_ title: String, value: Binding<Float>, in range: ClosedRange<Float>, format: String) -> some View {
+    private var metricControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Viewer", selection: $model.viewerPreset) {
+                ForEach(ViewerPreset.allCases) { p in Text(p.rawValue).tag(p) }
+            }
+            HStack(spacing: 6) {
+                floatField("IPD mm", value: $model.settings.viewer.ipdMM, format: "%.0f")
+                floatField("Distance m", value: $model.settings.viewer.screenDistanceM, format: "%.2f")
+                floatField("Width m", value: $model.settings.viewer.screenWidthM, format: "%.2f")
+            }
+            .onChange(of: model.settings.viewer) { _, v in
+                if let g = model.viewerPreset.geometry, g != v { model.viewerPreset = .custom }
+            }
+            let inf = model.settings.viewer.infinityDisparity(px: model.settings.outputWidth)
+            Text(String(format: "Infinity = %.1f px behind the screen · screen plane at %.1f m", inf, model.settings.viewer.screenDistanceM))
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("Auto world scale (never smaller than real, enlarge to fit the screen plane)", isOn: $model.settings.autoWorldScale)
+            if model.settings.autoWorldScale {
+                slider("Pop-out budget for the nearest object", value: $model.settings.popBudgetPx, in: 0...40, format: "%.0f px")
+                Text(String(format: "Scene ×%.2f · nearest %.1f m", model.stats.worldScale, model.stats.nearestM))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            } else {
+                slider("World scale", value: Binding(get: { log2(model.settings.worldScale) }, set: { model.settings.worldScale = pow(2, $0) }),
+                       in: -2...3, format: "×%.2f", display: model.settings.worldScale)
+            }
+            slider("Max pop-out", value: $model.settings.maxCrossedPx, in: 0...120, format: "%.0f px")
+
+            Divider()
+            if model.settings.modelIsMetric {
+                Label("Main model outputs meters — no calibration needed", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.green)
+            } else {
+                Text("Metric calibrator (auto indoor/outdoor)").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Picker("", selection: $model.calibratorModelID) {
+                        Text("None").tag(String?.none)
+                        ForEach(model.metricModels) { m in Text(m.name).tag(Optional(m.id)) }
+                    }
+                    .labelsHidden()
+                    .onChange(of: model.calibratorModelID) { _, _ in Task { await model.loadSelectedCalibrator() } }
+                    if model.calibratorLoading { ProgressView().controlSize(.small) }
+                }
+                Picker("Compute", selection: $model.calibratorCompute) {
+                    ForEach(ComputeChoice.allCases) { c in Text(c.rawValue).tag(c) }
+                }
+                .onChange(of: model.calibratorCompute) { _, _ in Task { await model.loadSelectedCalibrator() } }
+                slider("Calibration rate", value: Binding(get: { Float(model.calibrationHz) }, set: { model.calibrationHz = Double($0) }), in: 0.5...10, format: "%.1f Hz")
+                let c = model.calibStats
+                if model.calibratorInfo == nil {
+                    Text("Select a metric model (e.g. DA3-Metric) to calibrate the fast model's scale.").font(.caption).foregroundStyle(.orange)
+                } else if c.valid {
+                    Text(String(format: "1/Z = %.3f·r + %.3f · fit %.0f%% inliers · %.1f Hz · %.0f ms", c.a, c.b, c.inlierFraction * 100, c.hz, c.lastMs))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                } else {
+                    Text("Waiting for the first calibration…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func floatField(_ label: String, value: Binding<Float>, format: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospacedDigit())
+                .frame(width: 70)
+        }
+    }
+
+    private func slider(_ title: String, value: Binding<Float>, in range: ClosedRange<Float>, format: String, display: Float? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(title).font(.caption)
                 Spacer()
-                Text(String(format: format, value.wrappedValue)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text(String(format: format, display ?? value.wrappedValue)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Slider(value: value, in: range)
         }
