@@ -1,0 +1,6 @@
+DA3Small_644x364
+corr=1.00000
+rel_err=0.00060
+status=PASS
+output=ImageType GRAYSCALE_FLOAT16
+polarity=depth (larger = farther)

@@ -1,0 +1,10 @@
+.build/
+build/
+dist/
+models/
+convert/DepthAnythingV3/
+convert/__pycache__/
+convert/*.png
+*.mlpackage
+*.mlmodelc
+.DS_Store

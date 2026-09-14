@@ -1,0 +1,25 @@
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/apple-dav2-small/DepthAnythingV2SmallF16.mlpackage
+DepthAnythingV2SmallF16: in 'image' 518x392 image(BGRA) -> out 'depth' 518x392 image(L00h)
+  all load 0.75s | median 14.48 ms | p90 14.92 ms | min 13.92 ms | wall 14.55 ms -> 68.7 fps | range [0.000, 0.865]
+  ane load 0.05s | median 23.41 ms | p90 23.47 ms | min 22.46 ms | wall 23.35 ms -> 42.8 fps | range [0.000, 0.865]
+  gpu load 0.10s | median 13.37 ms | p90 13.59 ms | min 12.73 ms | wall 13.36 ms -> 74.8 fps | range [0.000, 0.865]
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DAv2Small_518x294.mlpackage
+DAv2Small_518x294: in 'image' 518x294 image(BGRA) -> out 'depth' 518x294 image(L00h)
+  all load 0.05s | median 10.75 ms | p90 10.82 ms | min 10.66 ms | wall 10.76 ms -> 92.9 fps | range [0.000, 6.679]
+  ane load 0.05s | median 10.76 ms | p90 10.84 ms | min 10.66 ms | wall 10.76 ms -> 92.9 fps | range [0.000, 6.679]
+  gpu load 0.06s | median 9.86 ms | p90 10.12 ms | min 9.44 ms | wall 9.85 ms -> 101.5 fps | range [0.000, 6.665]
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DAv2Small_644x364.mlpackage
+DAv2Small_644x364: in 'image' 644x364 image(BGRA) -> out 'depth' 644x364 image(L00h)
+  all load 0.05s | median 29.45 ms | p90 29.59 ms | min 28.84 ms | wall 29.43 ms -> 34.0 fps | range [0.000, 6.447]
+  ane load 0.05s | median 29.42 ms | p90 29.52 ms | min 29.14 ms | wall 29.41 ms -> 34.0 fps | range [0.000, 6.447]
+  gpu load 0.06s | median 15.08 ms | p90 15.38 ms | min 14.50 ms | wall 15.09 ms -> 66.3 fps | range [0.000, 6.432]
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DAv2Small_812x462.mlpackage
+DAv2Small_812x462: in 'image' 812x462 image(BGRA) -> out 'depth' 812x462 image(L00h)
+  all load 0.05s | median 62.11 ms | p90 62.18 ms | min 61.18 ms | wall 62.12 ms -> 16.1 fps | range [0.000, 7.472]
+  ane load 0.05s | median 62.10 ms | p90 62.21 ms | min 59.78 ms | wall 61.97 ms -> 16.1 fps | range [0.000, 7.472]
+  gpu load 0.06s | median 26.66 ms | p90 26.97 ms | min 26.14 ms | wall 26.67 ms -> 37.5 fps | range [0.000, 7.479]
+Model: /Users/nikitasyzdykov/Desktop/real3d/models/custom/DA3Small_644x364.mlpackage
+DA3Small_644x364: in 'image' 644x364 image(BGRA) -> out 'depth' 644x364 image(L00h)
+  all load 0.08s | median 40.51 ms | p90 40.70 ms | min 39.62 ms | wall 40.49 ms -> 24.7 fps | range [0.198, 1.660]
+  ane load 0.05s | median 38.89 ms | p90 39.06 ms | min 38.26 ms | wall 38.88 ms -> 25.7 fps | range [0.198, 1.660]
+  gpu load 0.05s | median 11.57 ms | p90 11.70 ms | min 11.25 ms | wall 11.58 ms -> 86.4 fps | range [0.198, 1.657]
