@@ -75,6 +75,10 @@ public enum DepthEngineError: Error, CustomStringConvertible {
 /// with zero copies.
 public final class DepthEngine: @unchecked Sendable {
     public let model: MLModel
+    /// Second stage of a split model (features → depth), nil for single-stage models.
+    public let headModel: MLModel?
+    public let headComputeUnits: MLComputeUnits
+    public var isSplit: Bool { headModel != nil }
     public let info: DepthModelInfo
     public let computeUnits: MLComputeUnits
 
@@ -95,21 +99,43 @@ public final class DepthEngine: @unchecked Sendable {
 
     /// Compiles (if needed) and loads a model from a .mlpackage / .mlmodel / .mlmodelc URL.
     /// `fastPrediction` asks Core ML to specialize the graph for latency (longer first load).
-    public init(modelURL: URL, computeUnits: MLComputeUnits = .all, cacheDirectory: URL? = nil,
+    /// With `headURL` the model is split in two stages: `modelURL` (image → features) runs on
+    /// `computeUnits`, the head (features → depth) on `headComputeUnits`, falling back to the GPU
+    /// if the head can't be loaded there.
+    public init(modelURL: URL, headURL: URL? = nil, computeUnits: MLComputeUnits = .all,
+                headComputeUnits: MLComputeUnits = .cpuAndNeuralEngine, cacheDirectory: URL? = nil,
                 fastPrediction: Bool = false, lowPrecisionAccumulation: Bool = false) throws {
-        let compiledURL = try Self.compiledModelURL(for: modelURL, cacheDirectory: cacheDirectory)
-        let config = MLModelConfiguration()
-        config.computeUnits = computeUnits
-        if lowPrecisionAccumulation { config.allowLowPrecisionAccumulationOnGPU = true }
-        if fastPrediction, #available(macOS 15.0, *) {
-            var hints = MLOptimizationHints()
-            hints.reshapeFrequency = .infrequent
-            hints.specializationStrategy = .fastPrediction
-            config.optimizationHints = hints
+        func config(_ units: MLComputeUnits) -> MLModelConfiguration {
+            let config = MLModelConfiguration()
+            config.computeUnits = units
+            if lowPrecisionAccumulation { config.allowLowPrecisionAccumulationOnGPU = true }
+            if fastPrediction, #available(macOS 15.0, *) {
+                var hints = MLOptimizationHints()
+                hints.reshapeFrequency = .infrequent
+                hints.specializationStrategy = .fastPrediction
+                config.optimizationHints = hints
+            }
+            return config
         }
+        let compiledURL = try Self.compiledModelURL(for: modelURL, cacheDirectory: cacheDirectory)
         self.computeUnits = computeUnits
-        self.model = try MLModel(contentsOf: compiledURL, configuration: config)
-        self.info = try Self.inspect(model: model, name: modelURL.deletingPathExtension().lastPathComponent)
+        self.model = try MLModel(contentsOf: compiledURL, configuration: config(computeUnits))
+        var name = modelURL.deletingPathExtension().lastPathComponent
+        if let headURL {
+            if name.hasSuffix(".enc") { name.removeLast(4) }
+            let headCompiled = try Self.compiledModelURL(for: headURL, cacheDirectory: cacheDirectory)
+            do {
+                self.headModel = try MLModel(contentsOf: headCompiled, configuration: config(headComputeUnits))
+                self.headComputeUnits = headComputeUnits
+            } catch {
+                self.headModel = try MLModel(contentsOf: headCompiled, configuration: config(.cpuAndGPU))
+                self.headComputeUnits = .cpuAndGPU
+            }
+        } else {
+            self.headModel = nil
+            self.headComputeUnits = computeUnits
+        }
+        self.info = try Self.inspect(inputModel: model, outputModel: headModel ?? model, name: name)
         try allocateBackings()
     }
 
@@ -147,8 +173,8 @@ public final class DepthEngine: @unchecked Sendable {
         return dest
     }
 
-    static func inspect(model: MLModel, name: String) throws -> DepthModelInfo {
-        let desc = model.modelDescription
+    static func inspect(inputModel: MLModel, outputModel: MLModel, name: String) throws -> DepthModelInfo {
+        var desc = inputModel.modelDescription
         // Input: prefer image; else a [1,3,H,W] / [3,H,W] multiarray.
         var inName = "", inW = 0, inH = 0, inIsImage = false
         var inFmt: OSType = kCVPixelFormatType_32BGRA
@@ -170,6 +196,7 @@ public final class DepthEngine: @unchecked Sendable {
             }
         }
         guard !inName.isEmpty else { throw DepthEngineError.noImageInput }
+        desc = outputModel.modelDescription
 
         // Output: prefer image; else a multiarray whose last two dims are H,W.
         var outName = "", outW = 0, outH = 0, outIsImage = false
@@ -257,25 +284,54 @@ public final class DepthEngine: @unchecked Sendable {
     /// `statsRect` (normalized) limits the depth statistics to the picture area, excluding letterbox bars.
     public func predict(_ input: CVPixelBuffer, statsRect: CGRect? = nil) throws -> DepthResult {
         let t0 = CACurrentMediaTime()
-        let provider: MLFeatureProvider
-        if info.inputIsImage {
-            provider = try MLDictionaryFeatureProvider(dictionary: [info.inputName: MLFeatureValue(pixelBuffer: input)])
-        } else {
-            fillInputArray(from: input)
-            provider = try MLDictionaryFeatureProvider(dictionary: [info.inputName: MLFeatureValue(multiArray: inputArray!)])
-        }
+        if isSplit { return try decode(try encode(input), statsRect: statsRect, startTime: t0) }
         let opts = MLPredictionOptions()
-        let outPB = outputPool[outputPoolIndex]
-        outputPoolIndex = (outputPoolIndex + 1) % outputPool.count
+        let outPB = nextOutputBuffer()
         if info.outputIsImage {
             opts.outputBackings = [info.outputName: outPB]
         } else if let arr = outputArray {
             opts.outputBackings = [info.outputName: arr]
         }
-        let out = try model.prediction(from: provider, options: opts)
-        guard let fv = out.featureValue(for: info.outputName) else { throw DepthEngineError.noOutput }
+        let out = try model.prediction(from: try inputProvider(input), options: opts)
+        return try finish(out, outPB: outPB, statsRect: statsRect, startTime: t0)
+    }
 
-        var result = outPB
+    /// Split models, stage 1 (image → features). May run concurrently with `decode` on another thread,
+    /// but calls to `encode` must be serial.
+    public func encode(_ input: CVPixelBuffer) throws -> MLFeatureProvider {
+        try model.prediction(from: try inputProvider(input))
+    }
+
+    /// Split models, stage 2 (features → depth). Calls must be serial; `startTime` is when stage 1 began.
+    public func decode(_ features: MLFeatureProvider, statsRect: CGRect? = nil, startTime: CFTimeInterval) throws -> DepthResult {
+        guard let head = headModel else { throw DepthEngineError.unsupportedOutput("not a split model") }
+        let opts = MLPredictionOptions()
+        let outPB = nextOutputBuffer()
+        if info.outputIsImage {
+            opts.outputBackings = [info.outputName: outPB]
+        } else if let arr = outputArray {
+            opts.outputBackings = [info.outputName: arr]
+        }
+        let out = try head.prediction(from: features, options: opts)
+        return try finish(out, outPB: outPB, statsRect: statsRect, startTime: startTime)
+    }
+
+    private func inputProvider(_ input: CVPixelBuffer) throws -> MLFeatureProvider {
+        if info.inputIsImage {
+            return try MLDictionaryFeatureProvider(dictionary: [info.inputName: MLFeatureValue(pixelBuffer: input)])
+        }
+        fillInputArray(from: input)
+        return try MLDictionaryFeatureProvider(dictionary: [info.inputName: MLFeatureValue(multiArray: inputArray!)])
+    }
+
+    private func nextOutputBuffer() -> CVPixelBuffer {
+        let pb = outputPool[outputPoolIndex]
+        outputPoolIndex = (outputPoolIndex + 1) % outputPool.count
+        return pb
+    }
+
+    private func finish(_ out: MLFeatureProvider, outPB: CVPixelBuffer, statsRect: CGRect?, startTime t0: CFTimeInterval) throws -> DepthResult {
+        guard let fv = out.featureValue(for: info.outputName) else { throw DepthEngineError.noOutput }
         if info.outputIsImage {
             if let pb = fv.imageBufferValue, pb !== outPB {
                 // Backing was not honored; copy.
@@ -286,11 +342,10 @@ public final class DepthEngine: @unchecked Sendable {
         } else {
             throw DepthEngineError.unsupportedOutput("no image/array value")
         }
-        result = outPB
-        let (lo, hi) = Self.robustRange(of: result, invert: outputIsDepth, rect: statsRect)
+        let (lo, hi) = Self.robustRange(of: outPB, invert: outputIsDepth, rect: statsRect)
         let ms = (CACurrentMediaTime() - t0) * 1000
         sequence &+= 1
-        return DepthResult(pixelBuffer: result, lo: lo, hi: hi, inferenceMs: ms, sequence: sequence)
+        return DepthResult(pixelBuffer: outPB, lo: lo, hi: hi, inferenceMs: ms, sequence: sequence)
     }
 
     // MARK: - Helpers

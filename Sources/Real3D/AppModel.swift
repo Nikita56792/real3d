@@ -8,6 +8,8 @@ struct ModelEntry: Identifiable, Hashable {
     let id: String
     let name: String
     let url: URL
+    /// Second stage of a split model (`Name.enc` + `Name.head`): encoder on the GPU, head on the Neural Engine.
+    var headURL: URL? = nil
     let outputIsDepth: Bool
     /// Outputs depth in meters (metric model).
     let isMetric: Bool
@@ -138,6 +140,8 @@ final class AppModel: ObservableObject {
     @Published var compute: ComputeChoice = .gpu { didSet { schedulePersist() } }
     /// What "Auto (fastest)" resolved to for the loaded model, for display.
     @Published var computeNote = ""
+    @Published var thermalState: ProcessInfo.ThermalState = .nominal
+    var selectedModelIsSplit: Bool { models.first { $0.id == selectedModelID }?.headURL != nil }
     @Published var modelInfo: DepthModelInfo?
     @Published var modelLoading = false
     @Published var stats = RenderStats()
@@ -322,13 +326,15 @@ final class AppModel: ObservableObject {
         do {
             var units = compute.units
             computeNote = ""
-            if compute == .all {
+            if m.headURL != nil {
+                computeNote = "Split model: encoder on GPU, head on Neural Engine (parallel)"
+            } else if compute == .all {
                 status = "Measuring \(m.name) on GPU and Neural Engine…"
                 let (u, note) = await fastestUnits(for: m)
                 units = u
                 computeNote = note
             }
-            let info = try await pipeline.loadModel(url: m.url, computeUnits: units, outputIsDepth: m.outputIsDepth)
+            let info = try await pipeline.loadModel(url: m.url, headURL: m.headURL, computeUnits: units, outputIsDepth: m.outputIsDepth)
             modelInfo = info
             FileLog.log("model loaded: \(info.description) on \(compute.rawValue) \(computeNote) metric=\(m.isMetric)")
             var s = settings
@@ -445,6 +451,8 @@ final class AppModel: ObservableObject {
     private func pollStats() {
         let s = pipeline.renderer.stats
         stats = s
+        let t = ProcessInfo.processInfo.thermalState
+        if t != thermalState { thermalState = t; FileLog.log("thermal state \(t.rawValue)") }
         calibStats = pipeline.calibrationStats
         if s.sourceSize != lastSourceSize, s.sourceSize.width > 0 {
             lastSourceSize = s.sourceSize
@@ -513,15 +521,28 @@ enum ModelCatalog {
         var out: [ModelEntry] = []
         for (dir, bundled) in dirs {
             guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+            var found: [URL] = []
             for case let u as URL in e {
                 let ext = u.pathExtension
                 guard ext == "mlpackage" || ext == "mlmodelc" || ext == "mlmodel" else { continue }
                 e.skipDescendants()
-                let name = u.deletingPathExtension().lastPathComponent
+                found.append(u)
+            }
+            for u in found {
+                var name = u.deletingPathExtension().lastPathComponent
+                var headURL: URL? = nil
+                if name.hasSuffix(".head") { continue }   // listed together with its .enc
+                if name.hasSuffix(".enc") {
+                    name.removeLast(4)
+                    guard let h = found.first(where: { $0.deletingPathExtension().lastPathComponent == name + ".head" }) else { continue }
+                    headURL = h
+                }
                 let lower = name.lowercased()
                 let isMetric = lower.contains("metric")
                 let isDepth = lower.contains("v3") || lower.contains("da3") || lower.contains("depthpro") || isMetric
-                out.append(ModelEntry(id: u.path, name: name, url: u, outputIsDepth: isDepth, isMetric: isMetric, isBundled: bundled))
+                // A split model keeps the id its single-file predecessor had, so saved selections survive.
+                let id = headURL == nil ? u.path : u.deletingLastPathComponent().appendingPathComponent(name + "." + u.pathExtension).path
+                out.append(ModelEntry(id: id, name: name, url: u, headURL: headURL, outputIsDepth: isDepth, isMetric: isMetric, isBundled: bundled))
             }
         }
         return out.sorted { $0.name < $1.name }

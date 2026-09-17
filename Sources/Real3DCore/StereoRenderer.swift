@@ -321,7 +321,7 @@ public final class StereoRenderer: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         modelInputWidth = inputWidth; modelInputHeight = inputHeight; modelInputFormat = inputFormat
         slots = []
-        for i in 0..<3 {
+        for i in 0..<5 {   // in flight: stage 1, stage 2, pending, + one to write the next frame
             let pb = try DepthEngine.makePixelBuffer(width: inputWidth, height: inputHeight, format: inputFormat)
             guard let tex = metalTexture(for: pb, format: .bgra8Unorm)?.1 else { throw RendererError.textureCache }
             slots.append(ModelInputSlot(index: i, pixelBuffer: pb, texture: tex))

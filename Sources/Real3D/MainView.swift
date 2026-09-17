@@ -144,6 +144,9 @@ struct MainView: View {
             Text(String(format: "render %.0f fps · gpu %.1f ms", s.renderFPS, s.gpuMs))
             Text(String(format: "depth %.0f fps · %.1f ms", s.depthFPS, s.inferenceMs))
             Text(String(format: "capture %.0f fps%@", s.captureFPS, s.usingMetalFX ? " · MetalFX" : ""))
+            if model.thermalState == .serious || model.thermalState == .critical {
+                Text("Mac is hot — GPU throttling, depth fps may drop").foregroundStyle(.orange)
+            }
         }
         .font(.caption2.monospacedDigit())
         .padding(6)
@@ -214,7 +217,8 @@ struct MainView: View {
                             ForEach(ComputeChoice.allCases) { c in Text(c.rawValue).tag(c) }
                         }
                         .onChange(of: model.compute) { _, _ in Task { await model.loadSelectedModel() } }
-                        if model.compute == .all, !model.computeNote.isEmpty {
+                        .disabled(model.selectedModelIsSplit)
+                        if model.selectedModelIsSplit || model.compute == .all, !model.computeNote.isEmpty {
                             Text(model.computeNote).font(.caption).foregroundStyle(.secondary)
                         }
                         Toggle("Model outputs depth (not inverse depth)", isOn: $model.settings.invertDepth)

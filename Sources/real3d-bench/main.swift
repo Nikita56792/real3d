@@ -32,6 +32,62 @@ func writePNG(width: Int, height: Int, bgra: [UInt8], to path: String) {
     print("  wrote \(path) (\(width)x\(height))")
 }
 
+// --pipeline <image> <model> [--head <head>] [--calib <metric>] [--metric] [seconds]
+// Feeds the real Pipeline/renderer with a 60 Hz source and 60 Hz render ticks; reports depth fps over time.
+if args.first == "--pipeline", args.count >= 3 {
+    guard let cg = loadImage(args[1]) else { print("cannot load image"); exit(1) }
+    let modelURL = URL(fileURLWithPath: args[2])
+    let headURL = args.firstIndex(of: "--head").map { URL(fileURLWithPath: args[$0 + 1]) }
+    let calibURL = args.firstIndex(of: "--calib").map { URL(fileURLWithPath: args[$0 + 1]) }
+    let seconds = args.compactMap { Double($0) }.last ?? 30
+    let pipeline = try Pipeline()
+    let sem = DispatchSemaphore(value: 0)
+    var loadErr: Error?
+    Task {
+        do {
+            let info = try await pipeline.loadModel(url: modelURL, headURL: headURL, computeUnits: .cpuAndGPU, outputIsDepth: false)
+            print("loaded \(info.description)")
+            if let calibURL {
+                let ci = try await pipeline.loadCalibrator(url: calibURL, computeUnits: .cpuAndNeuralEngine)
+                print("calibrator \(ci.name)")
+            }
+        } catch { loadErr = error }
+        sem.signal()
+    }
+    sem.wait()
+    if let loadErr { print("load failed: \(loadErr)"); exit(1) }
+    var st = pipeline.renderer.settings
+    if args.contains("--metric") { st.depthScaleMode = .metric }
+    pipeline.renderer.settings = st
+    if calibURL != nil { pipeline.setCalibration(enabled: true, hz: 4) }
+    // Two alternating source buffers so every frame is "new".
+    let srcs = try (0..<2).map { _ in try makeTestInput(width: cg.width, height: cg.height, format: kCVPixelFormatType_32BGRA, image: cg) }
+    let start = CACurrentMediaTime()
+    var next = start, frame = 0, lastReport = start
+    var samples: [Double] = []
+    while CACurrentMediaTime() - start < seconds {
+        pipeline.renderer.submitSource(srcs[frame % 2])
+        pipeline.renderer.renderFrame(layers: [])
+        frame += 1
+        next += 1.0 / 60.0
+        let now = CACurrentMediaTime()
+        if next > now { usleep(useconds_t((next - now) * 1_000_000)) }
+        if CACurrentMediaTime() - lastReport >= 5 {
+            let s = pipeline.renderer.stats
+            let c = pipeline.calibrationStats
+            samples.append(s.depthFPS)
+            print(String(format: "  t=%3.0fs render %.1f fps | depth %.1f fps, %.1f ms end-to-end | gpu %.2f ms | thermal %d%@",
+                         CACurrentMediaTime() - start, s.renderFPS, s.depthFPS, s.inferenceMs, s.gpuMs,
+                         ProcessInfo.processInfo.thermalState.rawValue,
+                         calibURL != nil ? String(format: " | calib %.1f Hz valid=%d", c.hz, c.valid ? 1 : 0) as NSString : "" as NSString))
+            lastReport = CACurrentMediaTime()
+        }
+    }
+    let sorted = samples.sorted()
+    print(String(format: "depth fps: min %.1f median %.1f", sorted.first ?? 0, sorted.isEmpty ? 0 : sorted[sorted.count / 2]))
+    exit(0)
+}
+
 // --throughput <model> <workers e.g. gpu,gpu> [seconds] [--fast] [--lowprec]
 // N engines predicting concurrently on their own threads; reports total fps and per-call latency.
 if args.first == "--throughput", args.count >= 3 {
@@ -258,7 +314,9 @@ if imagePath != nil && image == nil { print("WARNING: could not load image \(ima
 for (idx, (name, cu)) in units.enumerated() {
     do {
         let tl = Date()
-        let engine = try DepthEngine(modelURL: modelURL, computeUnits: cu)
+        let headPath = args.firstIndex(of: "--head").map { args[$0 + 1] }
+        let engine = headPath == nil ? try DepthEngine(modelURL: modelURL, computeUnits: cu)
+            : try DepthEngine(modelURL: modelURL, headURL: URL(fileURLWithPath: headPath!), computeUnits: .cpuAndGPU, headComputeUnits: .cpuAndNeuralEngine)
         let loadS = Date().timeIntervalSince(tl)
         if idx == 0 {
             print(engine.info.description)

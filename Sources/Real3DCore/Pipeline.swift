@@ -25,6 +25,10 @@ public final class Pipeline: @unchecked Sendable {
     private let log = Logger(subsystem: "real3d", category: "pipeline")
 
     private let inferenceQueue = DispatchQueue(label: "real3d.inference", qos: .userInteractive)
+    /// Split models: stage 2 runs here while stage 1 already encodes the next frame.
+    private let decodeQueue = DispatchQueue(label: "real3d.decode", qos: .userInteractive)
+    /// One decode in flight at a time; stage 1 waits for it, so frames stay in order.
+    private let decodeGate = DispatchSemaphore(value: 1)
     private let lock = NSLock()
     private var engine: DepthEngine?
     private var inferenceBusy = false
@@ -71,11 +75,14 @@ public final class Pipeline: @unchecked Sendable {
     // MARK: Model
 
     /// Loads a model on the inference queue; the renderer is reconfigured for its I/O.
-    public func loadModel(url: URL, computeUnits: MLComputeUnits, outputIsDepth: Bool) async throws -> DepthModelInfo {
+    /// `headURL` loads a split model: `url` on the GPU, the head on the Neural Engine.
+    public func loadModel(url: URL, headURL: URL? = nil, computeUnits: MLComputeUnits, outputIsDepth: Bool) async throws -> DepthModelInfo {
         try await withCheckedThrowingContinuation { cont in
             inferenceQueue.async { [self] in
                 do {
-                    let e = try DepthEngine(modelURL: url, computeUnits: computeUnits)
+                    decodeQueue.sync {}   // let a pending stage-2 of the previous model finish
+                    let e = headURL == nil ? try DepthEngine(modelURL: url, computeUnits: computeUnits)
+                        : try DepthEngine(modelURL: url, headURL: headURL, computeUnits: .cpuAndGPU, headComputeUnits: .cpuAndNeuralEngine)
                     e.outputIsDepth = outputIsDepth
                     try renderer.configureModel(inputWidth: e.info.inputWidth, inputHeight: e.info.inputHeight,
                                                 inputFormat: e.preferredInputPixelFormat,
@@ -277,17 +284,42 @@ public final class Pipeline: @unchecked Sendable {
         var slot: ModelInputSlot? = startSlot
         while let s = slot {
             lock.lock(); let e = engine; lock.unlock()
+            var handedOff = false
             if let e, CVPixelBufferGetWidth(s.pixelBuffer) == e.info.inputWidth, CVPixelBufferGetHeight(s.pixelBuffer) == e.info.inputHeight {
-                do {
-                    let r = try e.predict(s.pixelBuffer, statsRect: s.contentRect)
-                    r.tag = s.index
-                    renderer.submitDepth(r)
-                    maybeCalibrate(slot: s, result: r, engine: e)
-                } catch {
-                    log.error("inference failed: \(error.localizedDescription)")
+                if e.isSplit {
+                    // Stage 1 here, stage 2 on the decode queue; the slot stays busy until the depth is out
+                    // so the renderer's edge guide matches this frame.
+                    let t0 = CACurrentMediaTime()
+                    do {
+                        let features = try e.encode(s.pixelBuffer)
+                        decodeGate.wait()
+                        handedOff = true
+                        decodeQueue.async { [self] in
+                            defer { renderer.releaseSlot(s); decodeGate.signal() }
+                            do {
+                                let r = try e.decode(features, statsRect: s.contentRect, startTime: t0)
+                                r.tag = s.index
+                                renderer.submitDepth(r)
+                                maybeCalibrate(slot: s, result: r, engine: e)
+                            } catch {
+                                log.error("decode failed: \(error.localizedDescription)")
+                            }
+                        }
+                    } catch {
+                        log.error("encode failed: \(error.localizedDescription)")
+                    }
+                } else {
+                    do {
+                        let r = try e.predict(s.pixelBuffer, statsRect: s.contentRect)
+                        r.tag = s.index
+                        renderer.submitDepth(r)
+                        maybeCalibrate(slot: s, result: r, engine: e)
+                    } catch {
+                        log.error("inference failed: \(error.localizedDescription)")
+                    }
                 }
             }
-            renderer.releaseSlot(s)
+            if !handedOff { renderer.releaseSlot(s) }
             lock.lock()
             slot = pendingSlot
             pendingSlot = nil
