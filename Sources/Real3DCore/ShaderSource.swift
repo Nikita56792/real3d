@@ -15,6 +15,8 @@ struct CropParams {
     uint   outHeight;
     uint   supersample; // 1..4 samples per axis
     uint   _pad;
+    float2 validMin;   // source uv region that holds picture; outside -> black bars
+    float2 validMax;   // (disabled with a huge range for plain 16:9 crops)
 };
 
 struct DepthParams {
@@ -46,7 +48,8 @@ struct UpsampleParams {
     float metricB;     // IPD * screenDistance / pixelPitch
     float worldScale;  // multiplies scene depth
     float maxCrossed;  // clamp for near objects (px)
-    float _pad0, _pad1;
+    float2 contentMin; // output uv region with picture; bars outside get zero parallax
+    float2 contentMax; // (disabled with (-1,-1)..(2,2) for plain 16:9 crops)
 };
 
 struct StereoParams {
@@ -86,7 +89,7 @@ kernel void cropResample(texture2d<half, access::sample> src [[texture(0)]],
             float2 sub = (float2(i, j) + 0.5f) / float(n);
             float2 uvOut = (float2(gid) + sub) / outSize;
             float2 uv = P.uvOrigin + uvOut * P.uvSize;
-            acc += src.sample(linearClamp, uv);
+            if (all(uv >= P.validMin) && all(uv <= P.validMax)) acc += src.sample(linearClamp, uv);
         }
     }
     acc /= half(n * n);
@@ -136,8 +139,10 @@ kernel void depthUpsample(texture2d<float, access::sample> depthLow [[texture(0)
     if (gid.x >= P.outWidth || gid.y >= P.outHeight) return;
     float2 uv = (float2(gid) + 0.5f) / float2(P.outWidth, P.outHeight);
     float d;
+    const bool inContent = all(uv >= P.contentMin) && all(uv <= P.contentMax);
+    const float2 uvc = clamp(uv, P.contentMin, P.contentMax);   // never pull depth from the bars
     if (P.mode == 0) {
-        d = depthLow.sample(linearClamp, uv).r;
+        d = depthLow.sample(linearClamp, uvc).r;
     } else {
         const float2 lowSize = float2(depthLow.get_width(), depthLow.get_height());
         const float2 c = uv * lowSize - 0.5f;          // continuous low-res coordinate
@@ -150,6 +155,7 @@ kernel void depthUpsample(texture2d<float, access::sample> depthLow [[texture(0)
             for (int i = -P.radius; i <= P.radius + 1; ++i) {
                 int2 q = ci + int2(i, j);
                 float2 quv = (float2(q) + 0.5f) / lowSize;
+                if (any(quv < P.contentMin) || any(quv > P.contentMax)) continue;
                 float2 dq = float2(q) - c;
                 float iq = luma(guideLow.sample(nearestClamp, quv));
                 float di = ip - iq;
@@ -158,9 +164,9 @@ kernel void depthUpsample(texture2d<float, access::sample> depthLow [[texture(0)
                 wsum += w;
             }
         }
-        d = wsum > 1e-6f ? dsum / wsum : depthLow.sample(linearClamp, uv).r;
+        d = wsum > 1e-6f ? dsum / wsum : depthLow.sample(linearClamp, uvc).r;
         // Blend towards bilinear when the bilateral weights are all tiny (flat, dark, noisy areas).
-        float bil = depthLow.sample(linearClamp, uv).r;
+        float bil = depthLow.sample(linearClamp, uvc).r;
         d = mix(bil, d, saturate(wsum * 4.0f));
     }
     float disp;
@@ -173,6 +179,7 @@ kernel void depthUpsample(texture2d<float, access::sample> depthLow [[texture(0)
         d = pow(saturate(d), P.gamma);
         disp = P.strength * (d - P.convergence);
     }
+    if (!inContent) disp = 0.0f;   // letterbox bars sit on the screen plane
     dispOut.write(float4(disp, 0, 0, 1), gid);
 }
 

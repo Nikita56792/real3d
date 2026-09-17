@@ -33,7 +33,11 @@ enum ViewerPreset: String, CaseIterable, Identifiable {
 }
 
 enum ComputeChoice: String, CaseIterable, Identifiable {
-    case all = "Auto (all)", gpu = "GPU", ane = "Neural Engine", cpu = "CPU"
+    case all = "Auto (fastest)", gpu = "GPU", ane = "Neural Engine", cpu = "CPU"
+    /// Accepts the pre-1.2 label of `.all`.
+    init?(persisted: String) {
+        if persisted == "Auto (all)" { self = .all } else { self.init(rawValue: persisted) }
+    }
     var id: String { rawValue }
     var units: MLComputeUnits {
         switch self {
@@ -47,7 +51,7 @@ enum ComputeChoice: String, CaseIterable, Identifiable {
 
 struct PersistedState: Codable {
     var settings: SettingsCodable = .init()
-    var crops: [String: [Double]] = [:]      // source id → [x, y, w, h] normalized
+    var crops: [String: [Double]] = [:]      // source id → [x, y, w, h, free(0/1)] normalized
     var selectedModelID: String?
     var calibratorModelID: String?
     var calibratorCompute: String = ComputeChoice.ane.rawValue
@@ -100,8 +104,11 @@ final class AppModel: ObservableObject {
     @Published var selectedSourceID: String?
     @Published var isCapturing = false
     @Published var sourcePixelSize: CGSize = .zero
-    /// Crop in normalized source coordinates, always 16:9 in pixel space.
+    /// Crop in normalized source coordinates. 16:9 in pixel space unless `cropFree`; a free crop is
+    /// letterboxed/pillarboxed into the 16:9 output by the renderer.
     @Published var crop: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    @Published var cropFree = false
+    private var needsInitialCrop = true
     @Published var settings = RenderSettings() {
         didSet {
             pipeline.renderer.settings = settings
@@ -129,6 +136,8 @@ final class AppModel: ObservableObject {
     @Published var models: [ModelEntry] = []
     @Published var selectedModelID: String? { didSet { schedulePersist() } }
     @Published var compute: ComputeChoice = .gpu { didSet { schedulePersist() } }
+    /// What "Auto (fastest)" resolved to for the loaded model, for display.
+    @Published var computeNote = ""
     @Published var modelInfo: DepthModelInfo?
     @Published var modelLoading = false
     @Published var stats = RenderStats()
@@ -202,11 +211,15 @@ final class AppModel: ObservableObject {
             isCapturing = true
             status = "Capturing \(src.title)"
             errorMessage = nil
-            if let saved = state.crops[id], saved.count == 4 {
+            if let saved = state.crops[id], saved.count >= 4 {
                 crop = CGRect(x: saved[0], y: saved[1], width: saved[2], height: saved[3])
+                cropFree = saved.count >= 5 && saved[4] > 0.5
                 pipeline.renderer.crop = crop
+                needsInitialCrop = false
             } else {
                 crop = CGRect(x: 0, y: 0, width: 1, height: 1)
+                cropFree = false
+                needsInitialCrop = true
             }
         } catch {
             FileLog.log("capture start failed: \(error)")
@@ -223,13 +236,35 @@ final class AppModel: ObservableObject {
 
     // MARK: Crop
 
-    /// Largest centered 16:9 rectangle of the source.
+    /// 16:9 mode: largest centered 16:9 rectangle. Free mode: the whole source.
     func fitCrop() {
         guard sourcePixelSize.width > 0 else { return }
         let W = sourcePixelSize.width, H = sourcePixelSize.height
+        if cropFree { setCropPixels(CGRect(x: 0, y: 0, width: W, height: H)); return }
         var w = W, h = W * 9 / 16
         if h > H { h = H; w = H * 16 / 9 }
         setCropPixels(CGRect(x: (W - w) / 2, y: (H - h) / 2, width: w, height: h))
+    }
+
+    /// Whole source in free mode; the output gets bars if the source isn't 16:9.
+    func fullSourceCrop() {
+        cropFree = true
+        fitCrop()
+    }
+
+    /// Switches between aspect-locked 16:9 and free crops. Going back to 16:9 keeps the center and
+    /// takes the largest 16:9 rectangle inside the current crop.
+    func setCropFree(_ free: Bool) {
+        guard free != cropFree else { return }
+        cropFree = free
+        guard sourcePixelSize.width > 0 else { return }
+        if !free {
+            let r = cropPixels
+            let w = min(r.width, r.height * 16 / 9), h = w * 9 / 16
+            setCropPixels(CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h))
+        } else {
+            setCropPixels(cropPixels)
+        }
     }
 
     /// Crop of exactly w×(w*9/16) source pixels, centered (or at the same center as the current crop).
@@ -248,18 +283,33 @@ final class AppModel: ObservableObject {
                width: crop.width * sourcePixelSize.width, height: crop.height * sourcePixelSize.height)
     }
 
-    /// Clamps to the source, keeps 16:9, and pushes to the renderer.
+    /// Output framing of the current crop: nil for 16:9, otherwise "pillarbox"/"letterbox".
+    var cropBars: String? {
+        let r = cropPixels
+        guard r.height > 0 else { return nil }
+        let a = r.width / r.height
+        if abs(a / (16.0 / 9.0) - 1) <= 0.005 { return nil }
+        return a < 16.0 / 9.0 ? "pillarbox" : "letterbox"
+    }
+
+    /// Clamps to the source (keeping 16:9 unless free) and pushes to the renderer.
     func setCropPixels(_ r: CGRect) {
         guard sourcePixelSize.width > 0, sourcePixelSize.height > 0 else { return }
         let W = sourcePixelSize.width, H = sourcePixelSize.height
-        var w = max(min(r.width, W, H * 16 / 9), 64)
-        var h = w * 9 / 16
-        if h > H { h = H; w = h * 16 / 9 }
+        var w: CGFloat, h: CGFloat
+        if cropFree {
+            w = min(max(r.width, 64), W)
+            h = min(max(r.height, 36), H)
+        } else {
+            w = max(min(r.width, W, H * 16 / 9), 64)
+            h = w * 9 / 16
+            if h > H { h = H; w = h * 16 / 9 }
+        }
         let x = min(max(r.minX, 0), W - w)
         let y = min(max(r.minY, 0), H - h)
         crop = CGRect(x: x / W, y: y / H, width: w / W, height: h / H)
         pipeline.renderer.crop = crop
-        if let id = selectedSourceID { state.crops[id] = [crop.minX, crop.minY, crop.width, crop.height] }
+        if let id = selectedSourceID { state.crops[id] = [crop.minX, crop.minY, crop.width, crop.height, cropFree ? 1 : 0] }
         schedulePersist()
     }
 
@@ -270,9 +320,17 @@ final class AppModel: ObservableObject {
         modelLoading = true
         status = "Loading model \(m.name)…"
         do {
-            let info = try await pipeline.loadModel(url: m.url, computeUnits: compute.units, outputIsDepth: m.outputIsDepth)
+            var units = compute.units
+            computeNote = ""
+            if compute == .all {
+                status = "Measuring \(m.name) on GPU and Neural Engine…"
+                let (u, note) = await fastestUnits(for: m)
+                units = u
+                computeNote = note
+            }
+            let info = try await pipeline.loadModel(url: m.url, computeUnits: units, outputIsDepth: m.outputIsDepth)
             modelInfo = info
-            FileLog.log("model loaded: \(info.description) on \(compute.rawValue) metric=\(m.isMetric)")
+            FileLog.log("model loaded: \(info.description) on \(compute.rawValue) \(computeNote) metric=\(m.isMetric)")
             var s = settings
             s.invertDepth = m.outputIsDepth || m.isMetric
             s.modelIsMetric = m.isMetric
@@ -287,6 +345,40 @@ final class AppModel: ObservableObject {
             status = "Model error"
         }
         modelLoading = false
+    }
+
+    /// Core ML's `.all` often routes big-sequence models to the Neural Engine even when the GPU is 2× faster,
+    /// so "Auto" measures both once per model file and caches the winner.
+    private func fastestUnits(for m: ModelEntry) async -> (MLComputeUnits, String) {
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: m.url.path)) ?? [:]
+        let mod = Int((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        let key = "\(m.name)-\(mod)"
+        let cacheKey = "real3d.fastestUnits.v1"
+        var cache = (UserDefaults.standard.dictionary(forKey: cacheKey) as? [String: String]) ?? [:]
+        func result(_ v: String) -> (MLComputeUnits, String) {
+            let parts = v.split(separator: "|").map(String.init)
+            let ane = parts.first == "ane"
+            return (ane ? .cpuAndNeuralEngine : .cpuAndGPU, "→ " + (ane ? "Neural Engine" : "GPU") + (parts.count > 1 ? " (\(parts[1]))" : ""))
+        }
+        if let v = cache[key] { return result(v) }
+        let url = m.url
+        // Keep the running model and the calibrator off the GPU/ANE while measuring.
+        pipeline.setInferenceEnabled(false)
+        pipeline.setCalibration(enabled: false, hz: calibrationHz)
+        defer { pipeline.setInferenceEnabled(true); updateCalibrationState() }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        let measured: (Double, Double) = await Task.detached(priority: .userInitiated) {
+            let g = (try? DepthEngine.measureLatency(modelURL: url, computeUnits: .cpuAndGPU)) ?? .infinity
+            let a = (try? DepthEngine.measureLatency(modelURL: url, computeUnits: .cpuAndNeuralEngine)) ?? .infinity
+            return (g, a)
+        }.value
+        let (g, a) = measured
+        guard g.isFinite || a.isFinite else { return (.cpuAndGPU, "→ GPU") }
+        let v = (a < g * 0.9 ? "ane" : "gpu") + String(format: "|GPU %.1f ms, ANE %.1f ms", g, a)
+        FileLog.log("auto compute \(m.name): \(v)")
+        cache[key] = v
+        UserDefaults.standard.set(cache, forKey: cacheKey)
+        return result(v)
     }
 
     func loadSelectedCalibrator() async {
@@ -357,7 +449,7 @@ final class AppModel: ObservableObject {
         if s.sourceSize != lastSourceSize, s.sourceSize.width > 0 {
             lastSourceSize = s.sourceSize
             sourcePixelSize = s.sourceSize
-            if crop == CGRect(x: 0, y: 0, width: 1, height: 1) { fitCrop() } else { setCropPixels(cropPixels) }
+            if needsInitialCrop { needsInitialCrop = false; fitCrop() } else { setCropPixels(cropPixels) }
         }
     }
 
@@ -373,10 +465,11 @@ final class AppModel: ObservableObject {
             settings = s
             selectedModelID = st.selectedModelID
             calibratorModelID = st.calibratorModelID
-            calibratorCompute = ComputeChoice(rawValue: st.calibratorCompute) ?? .ane
+            let cc = ComputeChoice(persisted: st.calibratorCompute) ?? .ane
+            calibratorCompute = cc == .all ? .ane : cc
             calibrationHz = st.calibrationHz
             viewerPreset = ViewerPreset(rawValue: st.viewerPreset) ?? .custom
-            compute = ComputeChoice(rawValue: st.compute) ?? .gpu
+            compute = ComputeChoice(persisted: st.compute) ?? .gpu
             outputMode = PresentMode(rawValue: st.outputMode) ?? .fullSBS
             previewMode = PresentMode(rawValue: st.previewMode) ?? .anaglyph
             if let name = st.outputScreenName, let idx = NSScreen.screens.firstIndex(where: { $0.localizedName == name }) { selectedScreenIndex = idx }

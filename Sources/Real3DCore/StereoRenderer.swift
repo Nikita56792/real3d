@@ -14,6 +14,8 @@ struct CropParams {
     var outHeight: UInt32
     var supersample: UInt32
     var _pad: UInt32 = 0
+    var validMin = SIMD2<Float>(-1e4, -1e4)
+    var validMax = SIMD2<Float>(1e4, 1e4)
 }
 
 struct DepthParams {
@@ -45,7 +47,8 @@ struct UpsampleParams {
     var metricB: Float = 0
     var worldScale: Float = 1
     var maxCrossed: Float = 60
-    var _pad0: Float = 0, _pad1: Float = 0
+    var contentMin = SIMD2<Float>(-1, -1)
+    var contentMax = SIMD2<Float>(2, 2)
 }
 
 struct StereoParams {
@@ -183,6 +186,8 @@ public final class ModelInputSlot: @unchecked Sendable {
     public let pixelBuffer: CVPixelBuffer
     let texture: MTLTexture
     var busy = false
+    /// Region of the model input that holds picture (normalized); the rest are letterbox bars.
+    public internal(set) var contentRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     init(index: Int, pixelBuffer: CVPixelBuffer, texture: MTLTexture) {
         self.index = index; self.pixelBuffer = pixelBuffer; self.texture = texture
     }
@@ -424,9 +429,27 @@ public final class StereoRenderer: @unchecked Sendable {
         let srcW = Float(srcTex.width) * Float(srcRect.width), srcH = Float(srcTex.height) * Float(srcRect.height)
         let cropPxW = Float(crop.width) * srcW, cropPxH = Float(crop.height) * srcH
         // Crop in normalized coordinates of the full buffer.
-        let cropUV = SIMD2<Float>(Float(srcRect.minX + crop.minX * srcRect.width), Float(srcRect.minY + crop.minY * srcRect.height))
-        let cropUVSize = SIMD2<Float>(Float(crop.width * srcRect.width), Float(crop.height * srcRect.height))
-        let upscaling = s.useMetalFX && cropPxW < Float(s.outputWidth) && cropPxH < Float(s.outputHeight) && cropPxW >= 64 && cropPxH >= 36
+        let realUV = SIMD2<Float>(Float(srcRect.minX + crop.minX * srcRect.width), Float(srcRect.minY + crop.minY * srcRect.height))
+        let realUVSize = SIMD2<Float>(Float(crop.width * srcRect.width), Float(crop.height * srcRect.height))
+        // A crop that isn't 16:9 is centered in a 16:9 frame with black bars (letterbox / pillarbox).
+        let outAspect = Float(s.outputWidth) / Float(s.outputHeight)
+        let cropAspect = cropPxW / max(cropPxH, 1)
+        let letterboxed = abs(cropAspect / outAspect - 1) > 0.005
+        var effPxW = cropPxW, effPxH = cropPxH
+        if letterboxed { if cropAspect > outAspect { effPxH = cropPxW / outAspect } else { effPxW = cropPxH * outAspect } }
+        let cropUVSize = letterboxed ? realUVSize * SIMD2(effPxW / max(cropPxW, 1), effPxH / max(cropPxH, 1)) : realUVSize
+        let cropUV = letterboxed ? realUV + (realUVSize - cropUVSize) * 0.5 : realUV
+        var validMin = SIMD2<Float>(-1e4, -1e4), validMax = SIMD2<Float>(1e4, 1e4)
+        var contentMin = SIMD2<Float>(-1, -1), contentMax = SIMD2<Float>(2, 2)
+        var contentRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        if letterboxed {
+            validMin = realUV; validMax = realUV + realUVSize
+            contentMin = (realUV - cropUV) / cropUVSize
+            contentMax = (realUV + realUVSize - cropUV) / cropUVSize
+            contentRect = CGRect(x: CGFloat(contentMin.x), y: CGFloat(contentMin.y),
+                                 width: CGFloat(contentMax.x - contentMin.x), height: CGFloat(contentMax.y - contentMin.y))
+        }
+        let upscaling = s.useMetalFX && effPxW < Float(s.outputWidth) && effPxH < Float(s.outputHeight) && effPxW >= 64 && effPxH >= 36
         var usedMetalFX = false
 
         // 1. New depth map → normalize + EMA; keep a copy of the model input that produced it as the JBU guide.
@@ -478,9 +501,10 @@ public final class StereoRenderer: @unchecked Sendable {
         // 2. Crop → mono at output resolution (MetalFX spatial upscale when the crop is smaller than the output).
         if sourceDirty || paramsDirty {
             let enc = cb.makeComputeCommandEncoder()!
-            if upscaling, let scaler = spatialScaler(inW: Int(cropPxW.rounded()), inH: Int(cropPxH.rounded())), let native = cropNativeTex {
+            if upscaling, let scaler = spatialScaler(inW: Int(effPxW.rounded()), inH: Int(effPxH.rounded())), let native = cropNativeTex {
                 var p = CropParams(uvOrigin: cropUV, uvSize: cropUVSize,
-                                   outWidth: UInt32(native.width), outHeight: UInt32(native.height), supersample: 1)
+                                   outWidth: UInt32(native.width), outHeight: UInt32(native.height), supersample: 1,
+                                   validMin: validMin, validMax: validMax)
                 enc.setTexture(srcTex, index: 0); enc.setTexture(native, index: 1)
                 enc.setBytes(&p, length: MemoryLayout<CropParams>.stride, index: 0)
                 dispatch(enc, cropPSO, width: native.width, height: native.height)
@@ -490,9 +514,10 @@ public final class StereoRenderer: @unchecked Sendable {
                 scaler.encode(commandBuffer: cb)
                 usedMetalFX = true
             } else {
-                let ss = min(4, max(1, Int((cropPxW / Float(s.outputWidth)).rounded(.up))))
+                let ss = min(4, max(1, Int((effPxW / Float(s.outputWidth)).rounded(.up))))
                 var p = CropParams(uvOrigin: cropUV, uvSize: cropUVSize,
-                                   outWidth: UInt32(s.outputWidth), outHeight: UInt32(s.outputHeight), supersample: UInt32(ss))
+                                   outWidth: UInt32(s.outputWidth), outHeight: UInt32(s.outputHeight), supersample: UInt32(ss),
+                                   validMin: validMin, validMax: validMax)
                 enc.setTexture(srcTex, index: 0); enc.setTexture(monoTex, index: 1)
                 enc.setBytes(&p, length: MemoryLayout<CropParams>.stride, index: 0)
                 dispatch(enc, cropPSO, width: s.outputWidth, height: s.outputHeight)
@@ -505,6 +530,7 @@ public final class StereoRenderer: @unchecked Sendable {
             let enc = cb.makeComputeCommandEncoder()!
             let ss = min(4, max(1, Int((Float(s.outputWidth) / Float(modelInputWidth)).rounded(.up))))
             var p = CropParams(uvOrigin: SIMD2(0, 0), uvSize: SIMD2(1, 1), outWidth: UInt32(modelInputWidth), outHeight: UInt32(modelInputHeight), supersample: UInt32(ss))
+            slot.contentRect = contentRect
             enc.setTexture(monoTex, index: 0); enc.setTexture(slot.texture, index: 1)
             enc.setBytes(&p, length: MemoryLayout<CropParams>.stride, index: 0)
             dispatch(enc, cropPSO, width: modelInputWidth, height: modelInputHeight)
@@ -525,7 +551,8 @@ public final class StereoRenderer: @unchecked Sendable {
                                         radius: Int32(s.jbuRadius), sigmaSpatial: 1.0, sigmaRange: s.jbuSigmaRange,
                                         strength: s.strength, convergence: s.convergence, gamma: s.gamma,
                                         metric: lastMetricMode ? 1 : 0, metricA: ipd / pitch, metricB: ipd * s.viewer.screenDistanceM / pitch,
-                                        worldScale: s.autoWorldScale ? autoScale : s.worldScale, maxCrossed: s.maxCrossedPx)
+                                        worldScale: s.autoWorldScale ? autoScale : s.worldScale, maxCrossed: s.maxCrossedPx,
+                                        contentMin: contentMin, contentMax: contentMax)
                 enc.setTexture(cur, index: 0); enc.setTexture(guideTex ?? cur, index: 1); enc.setTexture(monoTex, index: 2); enc.setTexture(dispTex, index: 3)
                 enc.setBytes(&up, length: MemoryLayout<UpsampleParams>.stride, index: 0)
                 dispatch(enc, upsamplePSO, width: s.outputWidth, height: s.outputHeight)

@@ -157,13 +157,14 @@ public final class Pipeline: @unchecked Sendable {
         let raw = Self.readDepthMap(r.pixelBuffer)
         let rawInvert = e.outputIsDepth
         let rawW = CVPixelBufferGetWidth(r.pixelBuffer), rawH = CVPixelBufferGetHeight(r.pixelBuffer)
+        let content = slot.contentRect
         calibQueue.async { [self] in
             let t0 = CACurrentMediaTime()
             defer { lock.withLock { calibBusy = false } }
             guard let zr = try? c.predict(cin) else { return }
             let z = Self.readDepthMap(zr.pixelBuffer)
             let zW = CVPixelBufferGetWidth(zr.pixelBuffer), zH = CVPixelBufferGetHeight(zr.pixelBuffer)
-            guard let fit = Self.fitAffine(raw: raw, rawW: rawW, rawH: rawH, rawInvert: rawInvert, z: z, zW: zW, zH: zH) else { return }
+            guard let fit = Self.fitAffine(raw: raw, rawW: rawW, rawH: rawH, rawInvert: rawInvert, z: z, zW: zW, zH: zH, rect: content) else { return }
             let ms = (CACurrentMediaTime() - t0) * 1000
             lock.lock()
             var st = _calibStats
@@ -218,15 +219,16 @@ public final class Pipeline: @unchecked Sendable {
     public struct AffineFit { public var a: Float; public var b: Float; public var residual: Float; public var inliers: Float }
 
     /// Robust least squares 1/Z = a * r + b on a coarse grid, with two rounds of MAD-based outlier rejection.
-    public static func fitAffine(raw: [Float], rawW: Int, rawH: Int, rawInvert: Bool, z: [Float], zW: Int, zH: Int) -> AffineFit? {
+    public static func fitAffine(raw: [Float], rawW: Int, rawH: Int, rawInvert: Bool, z: [Float], zW: Int, zH: Int,
+                                 rect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)) -> AffineFit? {
         guard rawW > 0, rawH > 0, zW > 0, zH > 0, raw.count == rawW * rawH, z.count == zW * zH else { return nil }
         let gx = 128, gy = 72
         var xs: [Float] = [], ys: [Float] = []
         xs.reserveCapacity(gx * gy); ys.reserveCapacity(gx * gy)
         for j in 0..<gy {
-            let v = (Float(j) + 0.5) / Float(gy)
+            let v = Float(rect.minY) + (Float(j) + 0.5) / Float(gy) * Float(rect.height)
             for i in 0..<gx {
-                let u = (Float(i) + 0.5) / Float(gx)
+                let u = Float(rect.minX) + (Float(i) + 0.5) / Float(gx) * Float(rect.width)
                 var r = raw[min(Int(v * Float(rawH)), rawH - 1) * rawW + min(Int(u * Float(rawW)), rawW - 1)]
                 let d = z[min(Int(v * Float(zH)), zH - 1) * zW + min(Int(u * Float(zW)), zW - 1)]
                 guard r.isFinite, d.isFinite, d > 0.05, d < 2000 else { continue }
@@ -277,7 +279,7 @@ public final class Pipeline: @unchecked Sendable {
             lock.lock(); let e = engine; lock.unlock()
             if let e, CVPixelBufferGetWidth(s.pixelBuffer) == e.info.inputWidth, CVPixelBufferGetHeight(s.pixelBuffer) == e.info.inputHeight {
                 do {
-                    let r = try e.predict(s.pixelBuffer)
+                    let r = try e.predict(s.pixelBuffer, statsRect: s.contentRect)
                     r.tag = s.index
                     renderer.submitDepth(r)
                     maybeCalibrate(slot: s, result: r, engine: e)

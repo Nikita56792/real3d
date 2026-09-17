@@ -32,6 +32,50 @@ func writePNG(width: Int, height: Int, bgra: [UInt8], to path: String) {
     print("  wrote \(path) (\(width)x\(height))")
 }
 
+// --throughput <model> <workers e.g. gpu,gpu> [seconds] [--fast] [--lowprec]
+// N engines predicting concurrently on their own threads; reports total fps and per-call latency.
+if args.first == "--throughput", args.count >= 3 {
+    let modelURL = URL(fileURLWithPath: args[1])
+    let kinds = args[2].split(separator: ",").map(String.init)
+    let seconds = args.count > 3 ? Double(args[3]) ?? 6 : 6
+    let fast = args.contains("--fast"), lowp = args.contains("--lowprec")
+    let unitsFor: [String: MLComputeUnits] = ["gpu": .cpuAndGPU, "ane": .cpuAndNeuralEngine, "all": .all]
+    var engines: [DepthEngine] = []
+    var inputs: [CVPixelBuffer] = []
+    for k in kinds {
+        let e = try DepthEngine(modelURL: modelURL, computeUnits: unitsFor[k] ?? .cpuAndGPU, fastPrediction: fast, lowPrecisionAccumulation: lowp)
+        let inp = try makeTestInput(width: e.info.inputWidth, height: e.info.inputHeight, format: e.preferredInputPixelFormat, image: nil)
+        for _ in 0..<5 { _ = try e.predict(inp) }
+        engines.append(e); inputs.append(inp)
+    }
+    let lock = NSLock()
+    var counts = [Int](repeating: 0, count: engines.count)
+    var lat = [[Double]](repeating: [], count: engines.count)
+    let group = DispatchGroup()
+    let start = CACurrentMediaTime(), end = start + seconds
+    for i in engines.indices {
+        group.enter()
+        Thread.detachNewThread {
+            Thread.current.qualityOfService = .userInteractive
+            while CACurrentMediaTime() < end {
+                if let r = try? engines[i].predict(inputs[i]) { lock.withLock { counts[i] += 1; lat[i].append(r.inferenceMs) } }
+            }
+            group.leave()
+        }
+    }
+    group.wait()
+    let wall = CACurrentMediaTime() - start
+    let total = counts.reduce(0, +)
+    var parts: [String] = []
+    for i in engines.indices {
+        let l = lat[i].sorted()
+        parts.append(String(format: "%@ %.1f fps med %.1f ms", kinds[i] as NSString, Double(counts[i]) / wall, l.isEmpty ? 0 : l[l.count / 2]))
+    }
+    print(String(format: "%@ [%@%@%@]: TOTAL %.1f fps | %@", engines[0].info.name as NSString, args[2] as NSString,
+                 fast ? " fast" : "", lowp ? " lowprec" : "", Double(total) / wall, parts.joined(separator: " | ") as NSString))
+    exit(0)
+}
+
 // --stereo <image> <model> <outprefix> [strength] [convergence] [--calib <metricModel>] [--metric [worldScale]]
 if args.first == "--stereo", args.count >= 4 {
     let imgURL = args[1], modelPath = args[2], prefix = args[3]
@@ -63,7 +107,8 @@ if args.first == "--stereo", args.count >= 4 {
     let W = CGFloat(cg.width), H = CGFloat(cg.height)
     var cw = W, ch = W * 9 / 16
     if ch > H { ch = H; cw = H * 16 / 9 }
-    renderer.crop = CGRect(x: (W - cw) / 2 / W, y: (H - ch) / 2 / H, width: cw / W, height: ch / H)
+    renderer.crop = args.contains("--full") ? CGRect(x: 0, y: 0, width: 1, height: 1)
+        : CGRect(x: (W - cw) / 2 / W, y: (H - ch) / 2 / H, width: cw / W, height: ch / H)
     let sem = DispatchSemaphore(value: 0)
     var readySlot: ModelInputSlot?
     renderer.onModelInputReady = { slot in readySlot = slot; sem.signal() }

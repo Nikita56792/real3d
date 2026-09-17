@@ -94,14 +94,33 @@ public final class DepthEngine: @unchecked Sendable {
     private let imagenetStd: [Float] = [0.229, 0.224, 0.225]
 
     /// Compiles (if needed) and loads a model from a .mlpackage / .mlmodel / .mlmodelc URL.
-    public init(modelURL: URL, computeUnits: MLComputeUnits = .all, cacheDirectory: URL? = nil) throws {
+    /// `fastPrediction` asks Core ML to specialize the graph for latency (longer first load).
+    public init(modelURL: URL, computeUnits: MLComputeUnits = .all, cacheDirectory: URL? = nil,
+                fastPrediction: Bool = false, lowPrecisionAccumulation: Bool = false) throws {
         let compiledURL = try Self.compiledModelURL(for: modelURL, cacheDirectory: cacheDirectory)
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
+        if lowPrecisionAccumulation { config.allowLowPrecisionAccumulationOnGPU = true }
+        if fastPrediction, #available(macOS 15.0, *) {
+            var hints = MLOptimizationHints()
+            hints.reshapeFrequency = .infrequent
+            hints.specializationStrategy = .fastPrediction
+            config.optimizationHints = hints
+        }
         self.computeUnits = computeUnits
         self.model = try MLModel(contentsOf: compiledURL, configuration: config)
         self.info = try Self.inspect(model: model, name: modelURL.deletingPathExtension().lastPathComponent)
         try allocateBackings()
+    }
+
+    /// Median latency (ms) of `runs` predictions on a blank input after `warmup` predictions.
+    public static func measureLatency(modelURL: URL, computeUnits: MLComputeUnits, warmup: Int = 3, runs: Int = 7) throws -> Double {
+        let e = try DepthEngine(modelURL: modelURL, computeUnits: computeUnits)
+        let input = try makePixelBuffer(width: e.info.inputWidth, height: e.info.inputHeight, format: e.preferredInputPixelFormat)
+        for _ in 0..<warmup { _ = try e.predict(input) }
+        var t: [Double] = []
+        for _ in 0..<runs { t.append(try e.predict(input).inferenceMs) }
+        return t.sorted()[t.count / 2]
     }
 
     /// Returns a compiled .mlmodelc URL, compiling into the cache directory if the source is a package.
@@ -235,7 +254,8 @@ public final class DepthEngine: @unchecked Sendable {
 
     /// Runs one inference on a BGRA/RGB pixel buffer of exactly inputWidth x inputHeight.
     /// Thread-safe only if called serially (one in flight).
-    public func predict(_ input: CVPixelBuffer) throws -> DepthResult {
+    /// `statsRect` (normalized) limits the depth statistics to the picture area, excluding letterbox bars.
+    public func predict(_ input: CVPixelBuffer, statsRect: CGRect? = nil) throws -> DepthResult {
         let t0 = CACurrentMediaTime()
         let provider: MLFeatureProvider
         if info.inputIsImage {
@@ -267,7 +287,7 @@ public final class DepthEngine: @unchecked Sendable {
             throw DepthEngineError.unsupportedOutput("no image/array value")
         }
         result = outPB
-        let (lo, hi) = Self.robustRange(of: result, invert: outputIsDepth)
+        let (lo, hi) = Self.robustRange(of: result, invert: outputIsDepth, rect: statsRect)
         let ms = (CACurrentMediaTime() - t0) * 1000
         sequence &+= 1
         return DepthResult(pixelBuffer: result, lo: lo, hi: hi, inferenceMs: ms, sequence: sequence)
@@ -360,26 +380,34 @@ public final class DepthEngine: @unchecked Sendable {
     }
 
     /// Subsampled 2%/98% percentiles of a single-channel float16/float32 pixel buffer.
-    public static func robustRange(of pb: CVPixelBuffer, loPct: Float = 0.02, hiPct: Float = 0.98, invert: Bool = false) -> (Float, Float) {
+    public static func robustRange(of pb: CVPixelBuffer, loPct: Float = 0.02, hiPct: Float = 0.98, invert: Bool = false, rect: CGRect? = nil) -> (Float, Float) {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return (0, 1) }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         let stride = CVPixelBufferGetBytesPerRow(pb)
         let isHalf = CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_OneComponent16Half
-        let step = max(1, Int((Float(w * h) / 16000).squareRoot()))
+        // Sampled region (whole map unless a picture rect excludes letterbox bars).
+        var x0 = 0, x1 = w, y0 = 0, y1 = h
+        if let rect, rect != CGRect(x: 0, y: 0, width: 1, height: 1) {
+            x0 = min(max(Int((rect.minX * CGFloat(w)).rounded(.up)), 0), w - 1)
+            x1 = min(max(Int((rect.maxX * CGFloat(w)).rounded(.down)), x0 + 1), w)
+            y0 = min(max(Int((rect.minY * CGFloat(h)).rounded(.up)), 0), h - 1)
+            y1 = min(max(Int((rect.maxY * CGFloat(h)).rounded(.down)), y0 + 1), h)
+        }
+        let step = max(1, Int((Float((x1 - x0) * (y1 - y0)) / 16000).squareRoot()))
         var samples: [Float] = []
-        samples.reserveCapacity((w / step + 1) * (h / step + 1))
-        var y = 0
-        while y < h {
+        samples.reserveCapacity(((x1 - x0) / step + 1) * ((y1 - y0) / step + 1))
+        var y = y0
+        while y < y1 {
             let row = base + y * stride
-            var x = 0
+            var x = x0
             if isHalf {
                 let r = row.assumingMemoryBound(to: Float16.self)
-                while x < w { let v = Float(r[x]); if v.isFinite { samples.append(invert ? 1 / max(v, 1e-4) : v) }; x += step }
+                while x < x1 { let v = Float(r[x]); if v.isFinite { samples.append(invert ? 1 / max(v, 1e-4) : v) }; x += step }
             } else {
                 let r = row.assumingMemoryBound(to: Float.self)
-                while x < w { let v = r[x]; if v.isFinite { samples.append(invert ? 1 / max(v, 1e-4) : v) }; x += step }
+                while x < x1 { let v = r[x]; if v.isFinite { samples.append(invert ? 1 / max(v, 1e-4) : v) }; x += step }
             }
             y += step
         }

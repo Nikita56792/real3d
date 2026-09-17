@@ -59,18 +59,36 @@ struct MainView: View {
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 6))
 
-            HStack(spacing: 6) {
-                Text("Crop 16:9").font(.headline).fixedSize()
-                Button("Fit") { model.fitCrop() }.fixedSize()
-                Button("1920") { model.presetCrop(width: 1920) }.fixedSize()
-                Button("2560") { model.presetCrop(width: 2560) }.fixedSize()
-                Button("3840") { model.presetCrop(width: 3840) }.fixedSize()
-                Spacer(minLength: 4)
-                cropFields
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("Crop").font(.headline).fixedSize()
+                    Picker("", selection: Binding(get: { model.cropFree }, set: { model.setCropFree($0) })) {
+                        Text("16:9").tag(false)
+                        Text("Free").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 96)
+                    .help("Free: any aspect; the output is letterboxed/pillarboxed to 16:9 with black bars on the screen plane.")
+                    Button("Fit") { model.fitCrop() }.fixedSize()
+                    Button("Full screen") { model.fullSourceCrop() }.fixedSize()
+                        .help("Whole source in free mode, scaled into 16:9 with bars")
+                    Button("1920") { model.presetCrop(width: 1920) }.fixedSize()
+                    Button("2560") { model.presetCrop(width: 2560) }.fixedSize()
+                    Button("3840") { model.presetCrop(width: 3840) }.fixedSize()
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 6) {
+                    cropFields
+                    if let bars = model.cropBars {
+                        Text("→ 16:9 \(bars)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
             .controlSize(.small)
             .disabled(!model.isCapturing)
-            .help("Drag the rectangle to move, drag its corners to resize. Width presets are in source pixels.")
+            .help("Drag the rectangle to move, drag its corners (and edges in Free mode) to resize. Width presets are in source pixels.")
 
             ZStack {
                 MetalView(pipeline: model.pipeline, mode: model.previewMode)
@@ -101,8 +119,12 @@ struct MainView: View {
             let px = model.cropPixels
             numberField("X", value: px.minX) { model.setCropPixels(CGRect(x: $0, y: px.minY, width: px.width, height: px.height)) }
             numberField("Y", value: px.minY) { model.setCropPixels(CGRect(x: px.minX, y: $0, width: px.width, height: px.height)) }
-            numberField("W", value: px.width) { model.setCropPixels(CGRect(x: px.minX, y: px.minY, width: $0, height: $0 * 9 / 16)) }
-            Text("H \(Int(px.height.rounded()))").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+            numberField("W", value: px.width) { model.setCropPixels(CGRect(x: px.minX, y: px.minY, width: $0, height: model.cropFree ? px.height : $0 * 9 / 16)) }
+            if model.cropFree {
+                numberField("H", value: px.height) { model.setCropPixels(CGRect(x: px.minX, y: px.minY, width: px.width, height: $0)) }
+            } else {
+                Text("H \(Int(px.height.rounded()))").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+            }
         }
     }
 
@@ -192,6 +214,9 @@ struct MainView: View {
                             ForEach(ComputeChoice.allCases) { c in Text(c.rawValue).tag(c) }
                         }
                         .onChange(of: model.compute) { _, _ in Task { await model.loadSelectedModel() } }
+                        if model.compute == .all, !model.computeNote.isEmpty {
+                            Text(model.computeNote).font(.caption).foregroundStyle(.secondary)
+                        }
                         Toggle("Model outputs depth (not inverse depth)", isOn: $model.settings.invertDepth)
                         if model.modelLoading { ProgressView().controlSize(.small) }
                         if let info = model.modelInfo {
@@ -298,7 +323,7 @@ struct MainView: View {
                     if model.calibratorLoading { ProgressView().controlSize(.small) }
                 }
                 Picker("Compute", selection: $model.calibratorCompute) {
-                    ForEach(ComputeChoice.allCases) { c in Text(c.rawValue).tag(c) }
+                    ForEach(ComputeChoice.allCases.filter { $0 != .all }) { c in Text(c.rawValue).tag(c) }
                 }
                 .onChange(of: model.calibratorCompute) { _, _ in Task { await model.loadSelectedCalibrator() } }
                 slider("Calibration rate", value: Binding(get: { Float(model.calibrationHz) }, set: { model.calibrationHz = Double($0) }), in: 0.5...10, format: "%.1f Hz")
